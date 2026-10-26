@@ -66,10 +66,13 @@ evals:
 |-------|------|-------------|
 | `goal` | string | What the simulated user is trying to accomplish in this step |
 | `success_criteria` | string | The condition that determines whether this step is complete |
-| `response_guide` | string | Persona and context hints for the simulated user |
-| `max_turns` | int | Maximum turns allowed before declaring the step incomplete |
+| `response_guide` | string | Persona and context hints for the simulated user (alias `protocol`) |
+| `max_turns` | int | Maximum turns allowed before declaring the step incomplete (alias `max_turn_count`) |
 | `static_utterance` | string | Instead of AI simulation, send this exact text (useful for testing specific inputs) |
-| `inject_variables` | dict | Variables to inject for the first step only (overrides session_parameters) |
+| `event` | string | Optional event string to send for this step |
+| `inject_variables` | dict | Variables to inject for the first step (`step 0`); if declared on later steps, hoisted into `session_parameters` when converted to platform Milestone YAML |
+| `metadata` | dict | Optional step-level metadata dictionary |
+| `barge_in_after_ms` | int | Optional offset in ms after agent audio starts to trigger a barge-in utterance (local `audio` modality only; stripped when sanitizing for platform Milestone YAML) |
 
 ### Expectations
 
@@ -83,6 +86,77 @@ expectations:
 ```
 
 Each expectation is judged as Met or Not Met, with a justification from Gemini.
+
+---
+
+## Running Simulations on the Platform (CXAS 2.0 Milestone Evals)
+
+In addition to running locally via the Sessions API, SCRAPI can convert your simulation test cases (`evals:` YAML) into **CXAS 2.0 Platform Milestone Evaluations** (`scenario.milestones`) and run them directly on the CX Agent Studio platform.
+
+### How simulation-to-milestone conversion works
+
+When converting simulation test cases to CXAS 2.0 Milestone YAML (`EvalUtils.convert_sim_evals_to_milestone_yaml` or `SimulationEvals.to_milestone_yaml`):
+
+- Each evaluation and step is sanitized against the CES platform `MilestoneYamlTranslator` whitelists (`MILESTONE_ALLOWED_ROOT_KEYS`, `MILESTONE_ALLOWED_EVAL_KEYS`, `MILESTONE_ALLOWED_STEP_KEYS`).
+- Client-only keys (`audio_expectations`, `naturalness_metric`, `barge_in_after_ms`, `use_tool_fakes`, `modality`) are stripped automatically.
+- Step-level `inject_variables` on `step 0` are preserved, while `inject_variables` on later steps (`step_idx > 0`) are automatically hoisted into `session_parameters`.
+- When converting a directory of YAML files, file-level `common_session_parameters`, `common_expectations`, and `initial_event` are merged into each test case.
+- The sanitized YAML is imported via the CES REST `:importEvaluations` (`yamlContent`) endpoint, where each milestone is scored by the platform as `COMPLETED` (Pass), `IN_PROGRESS` (Fail), or `NOT_STARTED` (Fail) with a `justification`.
+
+### Option 1: Push & run via CLI
+
+Push your simulation YAML directly to the platform with `cxas push-eval`, then trigger and wait on all scenario evaluations with `cxas run --eval-type scenarios`:
+
+```bash
+# Convert and import simulation test cases as CXAS 2.0 Milestone evaluations
+cxas push-eval \
+  --app-name "projects/my-project/locations/us/apps/my-app" \
+  --file evals/simulations/order_sims.yaml
+
+# Trigger all scenario/milestone evaluations and wait for results
+cxas run \
+  --app-name "projects/my-project/locations/us/apps/my-app" \
+  --eval-type scenarios \
+  --run-count 3 \
+  --wait
+```
+
+### Option 2: Combined HTML report via CLI (`--platform-sims`)
+
+Pass `--platform-sims` to `cxas evals report` to execute platform-compatible simulations on the CX Agent Studio platform and include their milestone results in the combined HTML report:
+
+```bash
+cxas evals report \
+  --run \
+  --include sims \
+  --platform-sims \
+  --app-name "projects/my-project/locations/us/apps/my-app" \
+  --output-dir "eval-reports"
+```
+
+### Option 3: Programmatic SDK (`SimulationEvals`)
+
+```python
+from cxas_scrapi.evals.simulation_evals import SimulationEvals
+
+sim_evals = SimulationEvals(app_name="projects/my-project/locations/us/apps/my-app")
+
+# 1. Inspect the generated CXAS 2.0 Milestone YAML
+yaml_str = sim_evals.to_milestone_yaml(test_cases)
+
+# 2. Push simulation test cases to the platform as Milestone evaluations
+sim_evals.push_to_platform(test_cases)
+
+# 3. Run simulations on the platform with automatic hybrid fallback
+results = sim_evals.run_simulations(
+    test_cases=test_cases,
+    runs=3,
+    run_on_platform=True,
+)
+```
+
+!!! info "Automatic hybrid routing (`run_on_platform=True`)"
+    When `run_on_platform=True` (or `--platform-sims` on the CLI) is enabled, `SimulationEvals.requires_local_execution(test_case)` inspects each test case. Standard text simulations run on the platform as CXAS 2.0 Milestone evaluations, while test cases that require local-only features (`modality: "audio"`, `audio_expectations`, `naturalness_metric`, `use_tool_fakes`, or `barge_in_after_ms`) are automatically partitioned and executed locally.
 
 ---
 

@@ -49,9 +49,35 @@ cxas test-callbacks \
   --app-dir cxas_app/My\ Support\ Agent
 ```
 
-### Local Simulations
+### Simulations (Local & Platform Milestone Evals)
 
-Local simulations don't have a dedicated CLI command — you run them via Python:
+You can run simulations either locally (via `cxas evals report` or Python) or directly on the CX Agent Studio platform as CXAS 2.0 Milestone evaluations:
+
+**Run on the platform via CLI:**
+
+```bash
+# Push simulation YAML as CXAS 2.0 Milestone evaluations
+cxas push-eval \
+  --app-name "projects/my-project/locations/us/apps/my-app" \
+  --file evals/simulations/order_sims.yaml
+
+# Trigger all scenario/milestone evaluations and wait for results
+cxas run \
+  --app-name "projects/my-project/locations/us/apps/my-app" \
+  --eval-type scenarios \
+  --run-count 3 \
+  --wait
+
+# Or run and generate an HTML report in one step:
+cxas evals report \
+  --run \
+  --include sims \
+  --platform-sims \
+  --app-name "projects/my-project/locations/us/apps/my-app" \
+  --output-dir "eval-reports"
+```
+
+**Run locally via Python:**
 
 ```python
 from cxas_scrapi.evals.simulation_evals import SimulationEvals
@@ -149,11 +175,10 @@ echo "Tool tests passed"
 
 # 3. Platform goldens (push + run)
 cxas push-eval --app-name "$APP" --file evals/goldens/order_lookup.yaml
-cxas run --app-name "$APP" --wait --filter-auto-metrics
+cxas run --app-name "$APP" --eval-type goldens --wait --filter-auto-metrics
 echo "Golden evals passed"
 
-# 4. Local simulations (slowest — run last)
-# Run local LLM-User simulation tests in parallel with tool fakes enabled:
+# 4. Simulations (run locally in parallel, or add --platform-sims for CXAS 2.0 Milestone evals)
 cxas evals report --run --include sims --app-name "$APP" --output-dir "eval-reports" --sim-parallel 5 --use-tool-fakes
 echo "Simulation evals passed"
 
