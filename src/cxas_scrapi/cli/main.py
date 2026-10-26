@@ -638,6 +638,10 @@ def combined_evals_report_cmd(args: argparse.Namespace) -> None:
             )
             sys.stderr.flush()
 
+    extra_report_kwargs = {}
+    if getattr(args, "audio_analysis", None) is not None:
+        extra_report_kwargs["audio_analysis"] = args.audio_analysis
+
     actual_output_path = generate_combined_report_from_dir(
         output_dir=output_dir,
         golden_run=args.golden_run,
@@ -673,6 +677,7 @@ def combined_evals_report_cmd(args: argparse.Namespace) -> None:
         report_format=getattr(args, "format", "html") or "html",
         vertex_location=getattr(args, "vertex_location", "global") or "global",
         naturalness=getattr(args, "naturalness", None),
+        **extra_report_kwargs,
     )
     print(f"Combined report generated at {actual_output_path}")
 
@@ -1883,6 +1888,16 @@ def get_parser() -> argparse.ArgumentParser:
             "even where a test case does declare it, which is useful when "
             "hill-climbing on correctness before tuning for naturalness. "
             "Omit the flag to let each test case decide."
+        ),
+    )
+    parser_report.add_argument(
+        "--audio-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run comprehensive audio analysis (Gemini multimodal audio checks, "
+            "signal-level acoustic & voice-drift metrics, and naturalness grading) "
+            "and include the Audio Analysis tab in the report. Off by default."
         ),
     )
     parser_report.add_argument(

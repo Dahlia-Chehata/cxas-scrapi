@@ -68,6 +68,21 @@ print(report)  # Colorized in terminal, styled HTML in Jupyter
 
 In `audio` modality the agent's recordings are attached to the grading call automatically, so pacing and emotion are judged from what the caller heard. `perceivedLatency` is measured from the conversation trace rather than judged, and a turn past `latency_failure_threshold_ms` fails the simulation outright.
 
+## Audio Analysis (optional)
+
+`SimulationEvals` can run comprehensive perceptual and acoustic voice evaluations by setting `audio_analysis=True` (off by default):
+
+```python
+sim = SimulationEvals(
+    app_name=app_name,
+    audio_analysis=True,  # Opt-in audio evaluation
+)
+```
+
+- **Perceptual Audio Checks**: Runs 5 Gemini checks (voice consistency, pauses, looping, cutoff, agent trouble).
+- **Acoustic Consistency**: Measures ITU-R BS.1770 LUFS loudness, articulation rate, and F0 pitch stability.
+- **Voice Drift Detection**: Identifies cross-turn timbre and pitch seams, audio truncation, and loudness steps.
+
 ## Reference
 
 ::: cxas_scrapi.evals.simulation_evals.SimulationEvals

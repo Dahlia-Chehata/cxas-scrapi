@@ -21,6 +21,7 @@ import glob
 import json
 import math
 import os
+import pathlib
 import re
 import typing
 from collections.abc import Callable, Mapping, Sequence
@@ -31,7 +32,9 @@ import pandas as pd
 import yaml
 
 from cxas_scrapi.core import conversation_history, tools
+from cxas_scrapi.evals import naturalness
 from cxas_scrapi.evals import runner as evals_runner
+from cxas_scrapi.prompts import naturalness_prompts
 from cxas_scrapi.utils import (
     base_components,
     eval_utils,
@@ -39,6 +42,12 @@ from cxas_scrapi.utils import (
     report_components,
 )
 from cxas_scrapi.utils.latency_parser import LatencyParser
+from cxas_scrapi.utils.tracing import (
+    audio_analysis,
+    audio_drift,
+    audio_metrics,
+    audio_transcription,
+)
 
 _ORIG_OPEN = open
 
@@ -62,6 +71,26 @@ def _fmt_duration(seconds: typing.Any) -> str:
     if seconds >= seconds_per_minute:
         return f"{seconds / seconds_per_minute:.1f}m"
     return f"{seconds:.1f}s"
+
+
+def _join_chunk_text(
+    chunks: Sequence[Mapping[str, Any]] | None,
+) -> str:
+    """Join the text of every chunk in an agent response.
+
+    A single agent turn can be emitted as multiple chunks (e.g. a short
+    filler said before a tool call, then the substantive answer after the
+    tool returns). Rendering only the first chunk makes the turn look
+    truncated even though the platform stored — and the scorer evaluated —
+    the full response. Concatenate all chunk texts so the report matches.
+    """
+    if not chunks:
+        return ""
+    return " ".join(
+        text
+        for c in chunks
+        if isinstance(c, Mapping) and (text := (c.get("text") or "").strip())
+    )
 
 
 def _resolve_tool_name(
@@ -617,6 +646,9 @@ def _get_combined_template_module(
         "sim_wall_clock_s": 0,
         "failure_patterns_html": "",
         "suite_latency_html": "",
+        "suite_pl": None,
+        "suite_audio": None,
+        "suite_audio_html": "",
         "_fmt_duration": lambda s: f"{s:.1f}s",
         "_fmt_ms": _fmt_ms,
         "_pl_status_cls": _pl_status_cls,
@@ -646,6 +678,2437 @@ def _render_suite_latency_drawer(suite_pl: dict[str, Any] | None) -> str:
     return str(
         mod.render_suite_latency(suite_pl, trend_chart, _fmt_ms, _pl_status_cls)
     )
+
+
+def _extract_transcript_messages(r: dict[str, Any]) -> list[list[str]]:
+    """Extract normalized [who, text] chat messages from evaluation result."""
+    out: list[list[str]] = []
+
+    # 1. Direct transcript list of pairs or dicts
+    tr = r.get("transcript")
+    if isinstance(tr, list):
+        for item in tr:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                who_raw = str(item[0]).lower().strip()
+                who = (
+                    "caller"
+                    if who_raw in ("caller", "user", "human")
+                    else (
+                        "agent"
+                        if who_raw in ("agent", "bot", "assistant")
+                        else "event"
+                    )
+                )
+                out.append([who, str(item[1])])
+            elif isinstance(item, dict):
+                role = (
+                    str(item.get("role") or item.get("who") or "")
+                    .lower()
+                    .strip()
+                )
+                text = str(
+                    item.get("text")
+                    or item.get("content")
+                    or item.get("message")
+                    or ""
+                )
+                who = (
+                    "caller"
+                    if role in ("caller", "user", "human")
+                    else (
+                        "agent"
+                        if role in ("agent", "bot", "assistant")
+                        else "event"
+                    )
+                )
+                out.append([who, text])
+        if out:
+            return out
+
+    # 2. String transcript
+    if isinstance(tr, str) and tr.strip():
+        for raw_line in tr.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            line_low = line.lower()
+            if line_low.startswith("caller:") or line_low.startswith("user:"):
+                prefix_len = line.index(":") + 1
+                out.append(["caller", line[prefix_len:].strip()])
+            elif line_low.startswith("agent:") or line_low.startswith(
+                "agent text:"
+            ):
+                prefix_len = line.index(":") + 1
+                out.append(["agent", line[prefix_len:].strip()])
+            elif line_low.startswith("event:"):
+                prefix_len = line.index(":") + 1
+                out.append(["event", line[prefix_len:].strip()])
+            else:
+                out.append(["event", line])
+        if out:
+            return out
+
+    # 3. conversation list
+    conv = r.get("conversation")
+    if isinstance(conv, list):
+        for item in conv:
+            if isinstance(item, dict):
+                role = str(item.get("role") or "").lower().strip()
+                text = str(item.get("text") or item.get("content") or "")
+                who = (
+                    "caller"
+                    if role in ("caller", "user", "human")
+                    else (
+                        "agent"
+                        if role in ("agent", "bot", "assistant")
+                        else "event"
+                    )
+                )
+                out.append([who, text])
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                who_raw = str(item[0]).lower().strip()
+                who = (
+                    "caller"
+                    if who_raw in ("caller", "user", "human")
+                    else (
+                        "agent"
+                        if who_raw in ("agent", "bot", "assistant")
+                        else "event"
+                    )
+                )
+                out.append([who, str(item[1])])
+        if out:
+            return out
+
+    # 4. detailed_trace list
+    dt = r.get("detailed_trace")
+    if isinstance(dt, list):
+        for entry in dt:
+            for raw_line in str(entry).splitlines():
+                line = raw_line.strip()
+                if (
+                    not line
+                    or line.startswith("Agent Text (Diag):")
+                    or line.startswith("User Query:")
+                ):
+                    continue
+                if line.startswith("Agent Text:"):
+                    out.append(["agent", line[len("Agent Text:") :].strip()])
+                elif line.startswith("User:"):
+                    out.append(["caller", line[len("User:") :].strip()])
+                elif (
+                    line.startswith("Tool Call")
+                    or line.startswith("Tool Response")
+                    or line.startswith("Callback:")
+                ):
+                    out.append(["event", line])
+        if out:
+            return out
+
+    # 5. turns list
+    turns = r.get("turns")
+    if isinstance(turns, list):
+        for t in turns:
+            if isinstance(t, dict):
+                if t.get("user_query"):
+                    out.append(["caller", str(t["user_query"])])
+                elif t.get("user_text"):
+                    out.append(["caller", str(t["user_text"])])
+                elif t.get("user_input"):
+                    out.append(["caller", str(t["user_input"])])
+                if t.get("agent_response"):
+                    out.append(["agent", str(t["agent_response"])])
+                elif t.get("agent_text"):
+                    out.append(["agent", str(t["agent_text"])])
+                comparisons = t.get("comparisons")
+                if isinstance(comparisons, list):
+                    for c in comparisons:
+                        if isinstance(c, dict):
+                            c_type = c.get("type")
+                            actual = c.get("actual")
+                            if actual and actual != "(missed)":
+                                if c_type == "text":
+                                    out.append(["agent", str(actual)])
+                                elif c_type == "tool_call":
+                                    out.append(
+                                        ["event", f"Tool Call: {actual}"]
+                                    )
+                                elif c_type == "transfer":
+                                    out.append(["event", f"Transfer: {actual}"])
+                parts = t.get("parts")
+                if isinstance(parts, list):
+                    for p in parts:
+                        if isinstance(p, dict):
+                            role = str(p.get("role") or "").lower()
+                            chunks = p.get("chunks") or []
+                            txt = " ".join(
+                                c.get("text", "")
+                                for c in chunks
+                                if isinstance(c, dict)
+                            )
+                            who = (
+                                "caller"
+                                if role in ("caller", "user")
+                                else ("agent" if role == "agent" else "event")
+                            )
+                            if txt:
+                                out.append([who, txt])
+    return out
+
+
+def _collect_spans(node: Any) -> list[dict[str, Any]]:
+    """Recursively collect all span dicts from a trace root or turn node."""
+    collected: list[dict[str, Any]] = []
+    if not isinstance(node, dict):
+        return collected
+    if "name" in node:
+        collected.append(node)
+    for k in ("rootSpan", "root_span", "childSpans", "child_spans", "spans"):
+        val = node.get(k)
+        if isinstance(val, list):
+            for item in val:
+                collected.extend(_collect_spans(item))
+        elif isinstance(val, dict):
+            collected.extend(_collect_spans(val))
+    return collected
+
+
+def _aggregate_suite_audio_analysis(
+    sim_results: Sequence[Mapping[str, Any]] | None = None,
+    golden_results: Sequence[Mapping[str, Any]] | None = None,
+    audio_analysis: bool | None = None,
+) -> dict[str, Any]:
+    """Aggregate suite-level audio, voice quality, and language metrics."""
+    all_runs: list[dict[str, Any]] = []
+    if golden_results:
+        for r in golden_results:
+            d = dict(r)
+            d["_eval_type"] = "golden"
+            all_runs.append(d)
+    if sim_results:
+        for r in sim_results:
+            d = dict(r)
+            d["_eval_type"] = "sim"
+            all_runs.append(d)
+
+    total_runs = len(all_runs)
+    graded_runs_count = 0
+    naturalness_runs_count = 0
+    nat_scores: list[float] = []
+    gpa_scores: list[float] = []
+
+    grade_counts = {"human_like": 0, "transitional": 0, "bot_like": 0}
+    turn_grade_counts = {"Human-like": 0, "Transitional": 0, "Bot-like": 0}
+    total_graded_turns = 0
+
+    turn_factors_meta = [
+        ("emotion", "Emotion & Tone"),
+        ("pacing", "Pacing & Rhythm"),
+        ("grammarStyle", "Spoken Grammar Style"),
+        ("disfluency", "Natural Disfluency"),
+        ("lexicalVariety", "Lexical Variety"),
+        ("concision", "Concision & Spoken Length"),
+        ("spokenNumbers", "Spoken Numbers & Formatting"),
+        ("empathyCalibration", "Empathy Calibration"),
+        ("scriptedness", "Unscripted Delivery"),
+        ("turnTaking", "Turn-Taking & Barge-In"),
+        ("perceivedLatency", "Perceived Latency"),
+    ]
+    turn_factor_scores: dict[str, list[float]] = {
+        k: [] for k, _ in turn_factors_meta
+    }
+
+    conv_factors_meta = [
+        ("personaConsistency", "Persona Consistency"),
+        ("repetitionAvoidance", "Repetition Avoidance"),
+        ("emotionalArcTracking", "Emotional Arc Tracking"),
+        ("conversationalFlow", "Conversational Flow"),
+    ]
+    conv_factor_scores: dict[str, list[float]] = {
+        k: [] for k, _ in conv_factors_meta
+    }
+
+    check_keys = [
+        ("agent_voice_consistency", "Voice Consistency"),
+        ("no_long_pauses", "No Long Pauses (>20s)"),
+        ("agent_having_trouble", "No 'Having Trouble' Fallback"),
+        ("agent_looping", "No Agent Looping"),
+        ("agent_cutoff", "No Abrupt Audio Cutoff"),
+    ]
+    check_stats: dict[str, dict[str, int]] = {
+        k: {"pass": 0, "fail": 0, "skip": 0, "total": 0} for k, _ in check_keys
+    }
+
+    lang_counts: dict[str, int] = {}
+    lang_mismatches: dict[str, int] = {}
+    total_switches = 0
+    adhered_switches = 0
+    mismatch_switches = 0
+
+    wer_vals: list[float] = []
+    high_wer_count = 0
+
+    issues_meta = [
+        ("robotic_delivery", "Robotic / Scripted Delivery", "var(--serious)"),
+        ("language_mismatch", "Language Switch / Mismatch", "var(--critical)"),
+        (
+            "voice_drift",
+            "Voice Drift / Persona Inconsistency",
+            "var(--serious)",
+        ),
+        ("long_pauses", "Long Pauses / Dead Air", "var(--critical)"),
+        ("agent_looping", "Agent Looping / Repetition", "var(--critical)"),
+        ("audio_cutoff", "Abrupt Audio Cutoff / Truncation", "var(--critical)"),
+        (
+            "having_trouble",
+            "Agent Having Trouble / Error Fallback",
+            "var(--critical)",
+        ),
+        ("flat_emotion", "Flat Emotion or Empathy Mismatch", "var(--warn)"),
+        ("unnatural_pacing", "Unnatural Pacing or Rhythm", "var(--warn)"),
+        (
+            "written_grammar",
+            "Written-Style Grammar / Spoken Numbers",
+            "var(--warn)",
+        ),
+        ("overlong_turns", "Overlong / Verbose Spoken Turn", "var(--warn)"),
+        ("turn_taking", "Poor Turn-Taking / Barge-In", "var(--serious)"),
+        ("high_wer", "High Transcription WER (>25%)", "var(--warn)"),
+        ("audio_exp_failed", "Audio Expectation Not Met", "var(--serious)"),
+        (
+            "verdict_barged_missed",
+            "Interrupted Decisive Turn",
+            "var(--critical)",
+        ),
+        (
+            "wall_of_text",
+            "Wall of Text (>12s TTS / >80 words)",
+            "var(--serious)",
+        ),
+        (
+            "markdown_link_tts_leakage",
+            "Markdown Link / URL TTS Leakage",
+            "var(--critical)",
+        ),
+        (
+            "prompt_or_directive_leakage",
+            "Prompt / Directive Leakage",
+            "var(--critical)",
+        ),
+        (
+            "early_ack_redundancy",
+            "Redundant Early Acknowledgment",
+            "var(--warn)",
+        ),
+        (
+            "subagent_transfer_verbalization",
+            "Subagent Transfer Verbalization",
+            "var(--warn)",
+        ),
+        (
+            "subagent_ping_pong_loop",
+            "Subagent Ping-Pong Loop",
+            "var(--critical)",
+        ),
+        (
+            "ignored_user",
+            "Ignored Human Escalation Request",
+            "var(--critical)",
+        ),
+        (
+            "caller_requested_human",
+            "Caller Requested Human Agent",
+            "var(--warn)",
+        ),
+        ("tts_cache_seam", "TTS Cache Vintage Seam", "var(--serious)"),
+        ("loudness_jump", "Loudness Jump (>3.0 dB LUFS)", "var(--serious)"),
+        ("midturn_voice_seam", "Mid-Turn Voice Pitch Seam", "var(--critical)"),
+        ("audio_truncation", "Audio Playback Truncation", "var(--critical)"),
+    ]
+    issue_counts: dict[str, int] = {k: 0 for k, _, _ in issues_meta}
+    issue_dict: dict[str, tuple[str, str]] = {
+        k: (lbl, col) for k, lbl, col in issues_meta
+    }
+    issue_short_dict: dict[str, str] = {
+        "language_mismatch": "Lang mismatch",
+        "voice_drift": "Voice drift",
+        "long_pauses": "Dead air",
+        "agent_looping": "Looping",
+        "audio_cutoff": "Cutoff",
+        "having_trouble": "Trouble",
+        "flat_emotion": "Flat emotion",
+        "unnatural_pacing": "Pacing",
+        "written_grammar": "Grammar",
+        "overlong_turns": "Verbose",
+        "turn_taking": "Barge-in",
+        "high_wer": "High WER",
+        "audio_exp_failed": "Exp failed",
+        "verdict_barged_missed": "Barged verdict",
+        "wall_of_text": "Wall of text",
+        "markdown_link_tts_leakage": "TTS link leak",
+        "prompt_or_directive_leakage": "Prompt leak",
+        "early_ack_redundancy": "Early ack",
+        "subagent_transfer_verbalization": "Router leak",
+        "subagent_ping_pong_loop": "Ping-pong",
+        "ignored_user": "Ignored user",
+        "caller_requested_human": "Asked human",
+        "tts_cache_seam": "TTS seam",
+        "loudness_jump": "Loudness jump",
+        "midturn_voice_seam": "Voice seam",
+        "audio_truncation": "Truncation",
+    }
+
+    suite_barge_turns = 0
+    suite_total_turns = 0
+    suite_total_llm_turns = 0
+    sessions_with_barge_in = 0
+
+    suite_measured_acoustic_runs = 0
+    suite_clean_acoustic_runs = 0
+    suite_seam_runs = 0
+    suite_loud_runs = 0
+    suite_midturn_runs = 0
+    suite_trunc_runs = 0
+    suite_lufs_means: list[float] = []
+    suite_rate_means: list[float] = []
+    suite_f0_sds: list[float] = []
+    suite_max_seam_st = 0.0
+
+    run_rows: list[dict[str, Any]] = []
+    eval_run_indices: dict[tuple[str, str], int] = {}
+    spanish_words = {
+        "hola",
+        "gracias",
+        "por",
+        "favor",
+        "español",
+        "necesito",
+        "ayuda",
+        "cuenta",
+        "internet",
+        "servicio",
+        "buenos",
+        "dias",
+        "días",
+        "tardes",
+        "noches",
+    }
+
+    for idx, r in enumerate(all_runs):
+        is_graded = False
+        run_issues: list[str] = []
+
+        nat_details = r.get("naturalness_details")
+        nat_score: float | None = None
+        nat_label: str | None = None
+
+        if isinstance(nat_details, dict):
+            is_graded = True
+            raw_score = nat_details.get("overall_score")
+            if raw_score is not None:
+                with contextlib.suppress(ValueError, TypeError):
+                    nat_score = float(raw_score)
+            nat_label = nat_details.get("overall_label")
+
+            # Collect factor averages if explicitly provided
+            if isinstance(nat_details.get("factor_averages"), dict):
+                for q, s in nat_details["factor_averages"].items():
+                    if s is not None:
+                        try:
+                            s_val = float(s)
+                            if q not in turn_factor_scores:
+                                turn_factor_scores[q] = []
+                            turn_factor_scores[q].append(s_val)
+                        except (ValueError, TypeError):
+                            pass
+
+            for t in nat_details.get("turns", []):
+                t_lbl = t.get("label")
+                if t_lbl in turn_grade_counts:
+                    turn_grade_counts[t_lbl] += 1
+                    total_graded_turns += 1
+                for f in t.get("factors", []):
+                    q = f.get("quality")
+                    s = f.get("score")
+                    if q and s is not None:
+                        try:
+                            s_val = float(s)
+                            if q not in turn_factor_scores:
+                                turn_factor_scores[q] = []
+                            if not nat_details.get("factor_averages"):
+                                turn_factor_scores[q].append(s_val)
+                            if q == "scriptedness" and s_val <= 2:
+                                run_issues.append("robotic_delivery")
+                            elif (
+                                q in ("emotion", "empathyCalibration")
+                                and s_val <= 2
+                            ):
+                                run_issues.append("flat_emotion")
+                            elif q == "pacing" and s_val <= 2:
+                                run_issues.append("unnatural_pacing")
+                            elif (
+                                q in ("grammarStyle", "spokenNumbers")
+                                and s_val <= 2
+                            ):
+                                run_issues.append("written_grammar")
+                            elif q == "concision" and s_val <= 2:
+                                run_issues.append("overlong_turns")
+                            elif (
+                                q in ("turnTaking", "disfluency") and s_val <= 2
+                            ):
+                                run_issues.append("turn_taking")
+                            elif q == "perceivedLatency" and s_val <= 2:
+                                run_issues.append("long_pauses")
+                        except (ValueError, TypeError):
+                            pass
+
+            for f in nat_details.get("conversation_factors", []):
+                q = f.get("quality")
+                s = f.get("score")
+                if q and s is not None:
+                    try:
+                        s_val = float(s)
+                        if q not in conv_factor_scores:
+                            conv_factor_scores[q] = []
+                        conv_factor_scores[q].append(s_val)
+                        if q == "personaConsistency" and s_val <= 2:
+                            run_issues.append("voice_drift")
+                        elif q == "repetitionAvoidance" and s_val <= 2:
+                            run_issues.append("agent_looping")
+                        elif q == "emotionalArcTracking" and s_val <= 2:
+                            run_issues.append("flat_emotion")
+                        elif q == "conversationalFlow" and s_val <= 2:
+                            run_issues.append("turn_taking")
+                    except (ValueError, TypeError):
+                        pass
+
+            for reason in nat_details.get("failure_reasons", []):
+                r_low = reason.lower()
+                if "latency" in r_low or "slow" in r_low:
+                    run_issues.append("long_pauses")
+                if "language" in r_low:
+                    run_issues.append("language_mismatch")
+
+        if nat_score is None and r.get("naturalness"):
+            raw_nat = str(r["naturalness"])
+            m_s = re.search(r"(\d+(\.\d+)?)", raw_nat)
+            if m_s:
+                nat_score = float(m_s.group(1))
+                is_graded = True
+            if not nat_label and r.get("naturalness_label"):
+                nat_label = str(r["naturalness_label"])
+
+        grade_key = "ungraded"
+        grade_label = "Ungraded"
+        if nat_score is not None:
+            nat_scores.append(nat_score)
+            naturalness_runs_count += 1
+            if nat_score >= 4.0 or nat_label == "Human-like":
+                grade_key = "human_like"
+                grade_label = "Human-like"
+                gpa_scores.append(4.0)
+            elif nat_score >= 2.5 or nat_label == "Transitional":
+                grade_key = "transitional"
+                grade_label = "Transitional"
+                gpa_scores.append(3.0 if nat_score >= 3.5 else 2.0)
+            else:
+                grade_key = "bot_like"
+                grade_label = "Bot-like"
+                gpa_scores.append(1.0 if nat_score >= 1.5 else 0.0)
+                run_issues.append("robotic_delivery")
+            grade_counts[grade_key] += 1
+
+        # Language Detection & Language Switch
+        sparams = (
+            r.get("session_parameters", {})
+            if isinstance(r.get("session_parameters"), dict)
+            else {}
+        )
+        vconfig = (
+            r.get("voice_config", {})
+            if isinstance(r.get("voice_config"), dict)
+            else {}
+        )
+        raw_lang = (
+            r.get("language")
+            or r.get("routed_language")
+            or vconfig.get("language_code")
+            or sparams.get("language")
+            or sparams.get("lang")
+            or sparams.get("dfcx_lang")
+            or sparams.get("language_code")
+            or sparams.get("locale")
+            or sparams.get("preferred_language")
+            or sparams.get("target_language")
+            or ""
+        )
+        raw_lang_str = str(raw_lang).strip().lower()
+        if raw_lang_str.startswith("es") or "spanish" in raw_lang_str:
+            routed_lang = "Spanish"
+        elif raw_lang_str.startswith("fr") or "french" in raw_lang_str:
+            routed_lang = "French"
+        elif raw_lang_str.startswith("de") or "german" in raw_lang_str:
+            routed_lang = "German"
+        else:
+            routed_lang = "English"
+
+        text_corpus = " ".join(
+            [
+                str(r.get("name", "")),
+                str(r.get("detailed_trace", "")),
+                str(r.get("transcript", "")),
+                str(r.get("step_details", "")),
+                str(r.get("expectation_details", "")),
+            ]
+        ).lower()
+
+        has_spanish = any(w in text_corpus for w in spanish_words) or any(
+            c in text_corpus for c in "áéíóúñ¿¡"
+        )
+        sw_field = r.get("language_switch")
+        is_lang_switch = bool(
+            sw_field
+            or "language switch" in text_corpus
+            or "switch to spanish" in text_corpus
+            or "switch to english" in text_corpus
+            or "bilingual" in text_corpus
+            or "habla español" in text_corpus
+        )
+
+        is_mismatch = bool(
+            r.get("language_mismatch") is True
+            or (
+                isinstance(sw_field, dict)
+                and (
+                    sw_field.get("adhered") is False
+                    or sw_field.get("mismatch") is True
+                )
+            )
+        )
+
+        for exp in r.get("expectation_details") or []:
+            if isinstance(exp, dict):
+                e_txt = (
+                    str(exp.get("expectation", ""))
+                    + " "
+                    + str(exp.get("justification", ""))
+                ).lower()
+                e_stat = str(exp.get("status", "")).lower()
+                if any(
+                    k in e_txt
+                    for k in (
+                        "language",
+                        "spanish",
+                        "english",
+                        "switch",
+                        "bilingual",
+                        "idioma",
+                    )
+                ) and any(
+                    bad in e_stat for bad in ("not met", "fail", "incomplete")
+                ):
+                    is_mismatch = True
+
+        for step in r.get("step_details") or []:
+            if isinstance(step, dict):
+                s_txt = (
+                    str(step.get("goal", ""))
+                    + " "
+                    + str(step.get("justification", ""))
+                ).lower()
+                s_stat = str(step.get("status", "")).lower()
+                if any(
+                    k in s_txt
+                    for k in (
+                        "language",
+                        "spanish",
+                        "english",
+                        "switch",
+                        "bilingual",
+                    )
+                ) and any(bad in s_stat for bad in ("fail", "incomplete")):
+                    is_mismatch = True
+
+        lang_name = routed_lang
+        if routed_lang == "English" and has_spanish and not is_lang_switch:
+            lang_name = "Spanish"
+
+        lang_counts[lang_name] = lang_counts.get(lang_name, 0) + 1
+        if is_mismatch:
+            lang_mismatches[lang_name] = lang_mismatches.get(lang_name, 0) + 1
+            run_issues.append("language_mismatch")
+
+        if is_lang_switch:
+            total_switches += 1
+            if is_mismatch:
+                mismatch_switches += 1
+            else:
+                adhered_switches += 1
+
+        # Multimodal Audio Checks
+        audio_checks_map = (
+            r.get("audio_analysis", {})
+            if isinstance(r.get("audio_analysis"), dict)
+            else {}
+        )
+        checks_passed = 0
+        checks_total = 0
+        for ck, _ in check_keys:
+            val = audio_checks_map.get(ck)
+            if val is not None:
+                is_graded = True
+                checks_total += 1
+                res = str(
+                    val.get("result", "") if isinstance(val, dict) else val
+                ).upper()
+                if "PASS" in res:
+                    check_stats[ck]["pass"] += 1
+                    checks_passed += 1
+                elif "FAIL" in res:
+                    check_stats[ck]["fail"] += 1
+                    if ck == "agent_voice_consistency":
+                        run_issues.append("voice_drift")
+                    elif ck == "no_long_pauses":
+                        run_issues.append("long_pauses")
+                    elif ck == "agent_having_trouble":
+                        run_issues.append("having_trouble")
+                    elif ck == "agent_looping":
+                        run_issues.append("agent_looping")
+                    elif ck == "agent_cutoff":
+                        run_issues.append("audio_cutoff")
+                else:
+                    check_stats[ck]["skip"] += 1
+                check_stats[ck]["total"] += 1
+
+        if r.get("audio_expectations"):
+            is_graded = True
+        for exp in r.get("expectation_details") or []:
+            if isinstance(exp, dict) and exp.get("requires_audio_paths"):
+                is_graded = True
+                if str(exp.get("status", "")).lower() in ("not met", "fail"):
+                    run_issues.append("audio_exp_failed")
+
+        # WER
+        wer_val = (
+            r.get("wer") or r.get("overall_wer") or r.get("average_turn_wer")
+        )
+        if wer_val is not None:
+            try:
+                w_f = float(wer_val)
+                wer_vals.append(w_f)
+                is_graded = True
+                if w_f > 0.25:
+                    high_wer_count += 1
+                    run_issues.append("high_wer")
+            except (ValueError, TypeError):
+                pass
+
+        # Extract intent
+        val = (
+            r.get("file_name")
+            or r.get("file")
+            or r.get("source_file")
+            or r.get("eval_file")
+            or r.get("intent")
+            or r.get("name")
+        )
+        run_intent = pathlib.Path(str(val)).stem if val else "unknown"
+
+        # Deterministic Phase 1 Extractor Signals
+        run_barge_turns = 0
+        has_barge_in = False
+        has_verdict_barged_missed = False
+        run_max_tts_ms = 0.0
+        run_agent_speech_ms = 0.0
+        agent_utterances: list[str] = []
+        caller_utterances: list[str] = []
+
+        turn_traces = r.get("turn_traces") or []
+        turn_tts_cache_types: list[str] = []
+        for t in turn_traces:
+            if not isinstance(t, dict):
+                continue
+            all_spans = _collect_spans(t)
+
+            turn_cached: bool | None = None
+            for span in all_spans:
+                s_name = str(span.get("name", "")).upper()
+                s_attrs = span.get("attributes") or {}
+                if (
+                    s_name == "TTS"
+                    or "time to first audio (ms)" in s_attrs
+                    or "cache hit" in s_attrs
+                    or "cached" in s_attrs
+                ):
+                    c_hit = s_attrs.get("cache hit")
+                    if c_hit is not None:
+                        turn_cached = bool(c_hit)
+                    elif s_attrs.get("cached") is not None:
+                        turn_cached = bool(s_attrs.get("cached"))
+                    elif span.get("cached") is not None:
+                        turn_cached = bool(span.get("cached"))
+                    elif s_attrs.get("time to first audio (ms)") is not None:
+                        with contextlib.suppress(ValueError, TypeError):
+                            turn_cached = (
+                                float(s_attrs["time to first audio (ms)"])
+                                < 50.0
+                            )
+            if turn_cached is not None:
+                turn_tts_cache_types.append(
+                    "cached" if turn_cached else "fresh"
+                )
+            else:
+                turn_tts_cache_types.append("")
+
+            t_interrupted = bool(
+                t.get("interrupted")
+                or t.get("agent_interrupted")
+                or t.get("vad_barge_in")
+                or t.get("barge_in")
+            )
+            for msg in t.get("messages") or []:
+                if (
+                    isinstance(msg, str)
+                    and "agent speaking was interrupted" in msg.lower()
+                ):
+                    t_interrupted = True
+                    break
+                elif isinstance(msg, dict):
+                    m_text = str(
+                        msg.get("text") or msg.get("message") or ""
+                    ).lower()
+                    if "agent speaking was interrupted" in m_text:
+                        t_interrupted = True
+                        break
+
+            for span in all_spans:
+                s_name = str(span.get("name", "")).lower()
+                s_attrs = span.get("attributes") or {}
+                if (
+                    "interruption" in s_name
+                    or s_attrs.get("barge-in")
+                    or s_attrs.get("barge_in")
+                    or s_attrs.get("interrupted")
+                ):
+                    t_interrupted = True
+                    break
+
+            if t_interrupted:
+                run_barge_turns += 1
+                has_barge_in = True
+                has_decisive_action = bool(
+                    t.get("tool_name")
+                    or t.get("tool_call")
+                    or t.get("verdict_barged_missed")
+                    or any(
+                        "tool" in str(s.get("name", "")).lower()
+                        for s in all_spans
+                    )
+                )
+                if (
+                    has_decisive_action
+                    or t.get("verdict_barged_missed")
+                    or r.get("verdict_barged_missed")
+                ):
+                    has_verdict_barged_missed = True
+
+            # Track TTS duration per turn
+            turn_tts_ms = float(t.get("tts_ms") or 0.0)
+            for span in all_spans:
+                s_name = str(span.get("name", "")).upper()
+                s_attrs = span.get("attributes") or {}
+                dur_ms = None
+                if (
+                    s_name == "TTS"
+                    or "audio duration (ms)" in s_attrs
+                    or "audio_duration_ms" in s_attrs
+                ):
+                    raw_dur_ms = s_attrs.get(
+                        "audio duration (ms)"
+                    ) or s_attrs.get("audio_duration_ms")
+                    if raw_dur_ms is not None:
+                        with contextlib.suppress(ValueError, TypeError):
+                            dur_ms = float(raw_dur_ms)
+                    if dur_ms is None:
+                        dur = span.get("duration", "")
+                        if isinstance(dur, str) and dur.endswith("s"):
+                            with contextlib.suppress(ValueError):
+                                dur_ms = float(dur[:-1]) * 1000.0
+                        elif isinstance(dur, (int, float)):
+                            dur_ms = float(dur) * 1000.0
+                if dur_ms is not None and dur_ms > 0:
+                    turn_tts_ms = max(turn_tts_ms, dur_ms)
+
+            if turn_tts_ms > 0:
+                run_agent_speech_ms += turn_tts_ms
+                run_max_tts_ms = max(run_max_tts_ms, turn_tts_ms)
+                if turn_tts_ms > 12000.0:
+                    run_issues.append("wall_of_text")
+
+            for part in t.get("parts") or []:
+                role = part.get("role")
+                chunks = part.get("chunks") or []
+                text = " ".join(
+                    c.get("text", "") for c in chunks if isinstance(c, dict)
+                )
+                if not text and isinstance(part.get("text"), str):
+                    text = part["text"]
+                if role == "agent" and text:
+                    agent_utterances.append(text)
+                elif role in ("user", "caller") and text:
+                    caller_utterances.append(text)
+
+        if r.get("max_tts_ms"):
+            with contextlib.suppress(ValueError, TypeError):
+                run_max_tts_ms = max(run_max_tts_ms, float(r["max_tts_ms"]))
+        if r.get("agent_speech_ms"):
+            with contextlib.suppress(ValueError, TypeError):
+                run_agent_speech_ms = max(
+                    run_agent_speech_ms, float(r["agent_speech_ms"])
+                )
+        if run_max_tts_ms > 12000.0:
+            run_issues.append("wall_of_text")
+
+        if r.get("interruption_signal") or r.get("barge_in"):
+            has_barge_in = True
+            if run_barge_turns == 0:
+                run_barge_turns = 1
+
+        trace_has_seam = False
+        prev_annotated_type = ""
+        for ctype in turn_tts_cache_types:
+            if ctype:
+                if prev_annotated_type and ctype != prev_annotated_type:
+                    trace_has_seam = True
+                    break
+                prev_annotated_type = ctype
+
+        # PR #506 Barge-In and VAD evaluation fields
+        barge_in_details: list[dict[str, Any]] = []
+        for s_idx, step in enumerate(r.get("step_details") or []):
+            if not isinstance(step, dict):
+                continue
+            s_barge_ms = step.get("barge_in_after_ms")
+            s_interrupted = bool(step.get("agent_interrupted"))
+            s_vad_barge = bool(step.get("vad_barge_in"))
+            s_vad_skip = step.get("vad_skip_reason")
+            s_awareness = bool(step.get("barge_in_awareness_injected"))
+            s_meta = step.get("barge_in_metadata")
+            played_ms = None
+            total_ms = None
+            if s_meta is not None:
+                if isinstance(s_meta, dict):
+                    if s_meta.get("interrupted"):
+                        s_interrupted = True
+                    played_ms = s_meta.get("played_audio_duration_ms")
+                    total_ms = s_meta.get("total_audio_duration_ms")
+                elif hasattr(s_meta, "interrupted"):
+                    if s_meta.interrupted:
+                        s_interrupted = True
+                    played_ms = getattr(
+                        s_meta, "played_audio_duration_ms", None
+                    )
+                    total_ms = getattr(s_meta, "total_audio_duration_ms", None)
+
+            if s_interrupted or s_vad_barge:
+                has_barge_in = True
+                run_barge_turns += 1
+
+            if (
+                s_barge_ms is not None
+                or s_interrupted
+                or s_vad_barge
+                or s_vad_skip
+                or s_awareness
+                or s_meta is not None
+            ):
+                barge_in_details.append(
+                    {
+                        "step": step.get("turn") or f"Step {s_idx + 1}",
+                        "barge_in_after_ms": s_barge_ms,
+                        "agent_interrupted": s_interrupted,
+                        "vad_barge_in": s_vad_barge,
+                        "vad_skip_reason": str(s_vad_skip)
+                        if s_vad_skip
+                        else None,
+                        "barge_in_awareness_injected": s_awareness,
+                        "played_audio_duration_ms": (
+                            round(float(played_ms), 1)
+                            if played_ms is not None
+                            else None
+                        ),
+                        "total_audio_duration_ms": (
+                            round(float(total_ms), 1)
+                            if total_ms is not None
+                            else None
+                        ),
+                    }
+                )
+
+        if r.get("agent_interrupted") or r.get("vad_barge_in"):
+            has_barge_in = True
+            if run_barge_turns == 0:
+                run_barge_turns = 1
+
+        # Acoustic Signal & Voice Drift Metrics
+        a_metrics = r.get("audio_metrics") or r.get("voice_metrics")
+        call_metrics: dict[str, Any] = {}
+        turn_metrics_rows: list[dict[str, Any]] = []
+        if isinstance(a_metrics, tuple) and len(a_metrics) == 2:
+            call_metrics = (
+                dict(a_metrics[0]) if isinstance(a_metrics[0], dict) else {}
+            )
+            turn_metrics_rows = (
+                list(a_metrics[1]) if isinstance(a_metrics[1], list) else []
+            )
+        elif isinstance(a_metrics, dict):
+            if "call" in a_metrics and isinstance(a_metrics["call"], dict):
+                call_metrics = dict(a_metrics["call"])
+                turn_metrics_rows = list(a_metrics.get("turns") or [])
+            else:
+                call_metrics = dict(a_metrics)
+                turn_metrics_rows = list(a_metrics.get("turns") or [])
+
+        a_drift = r.get("audio_drift")
+        drift_rows: list[dict[str, Any]] = []
+        if isinstance(a_drift, list):
+            drift_rows = [dict(x) for x in a_drift if isinstance(x, dict)]
+        elif isinstance(a_drift, dict):
+            if "turns" in a_drift and isinstance(a_drift["turns"], list):
+                drift_rows = [
+                    dict(x) for x in a_drift["turns"] if isinstance(x, dict)
+                ]
+            elif "rows" in a_drift and isinstance(a_drift["rows"], list):
+                drift_rows = [
+                    dict(x) for x in a_drift["rows"] if isinstance(x, dict)
+                ]
+            elif "flagged" in a_drift and isinstance(a_drift["flagged"], list):
+                drift_rows = [
+                    dict(x) for x in a_drift["flagged"] if isinstance(x, dict)
+                ]
+
+        run_acoustic_flags: list[str] = []
+        if trace_has_seam:
+            run_acoustic_flags.append("SEAM")
+
+        for f in call_metrics.get("flags") or []:
+            f_str = str(f).upper()
+            if f_str not in run_acoustic_flags:
+                run_acoustic_flags.append(f_str)
+
+        for dr in drift_rows:
+            for f in dr.get("flags") or []:
+                f_str = str(f).upper()
+                if f_str not in run_acoustic_flags:
+                    run_acoustic_flags.append(f_str)
+
+        if "SEAM" in run_acoustic_flags:
+            run_issues.append("tts_cache_seam")
+
+        loud_thresh = getattr(
+            audio_drift,
+            "LOUD_STEP_LUFS",
+            getattr(audio_drift, "DEFAULT_LOUD_DB", 3.0),
+        )
+        has_loud = "LOUD" in run_acoustic_flags
+        if not has_loud:
+            adj_d = call_metrics.get("max_adj_dlufs")
+            if (
+                adj_d is not None
+                and isinstance(adj_d, (int, float))
+                and adj_d > loud_thresh
+            ):
+                has_loud = True
+                run_acoustic_flags.append("LOUD")
+        if has_loud:
+            run_issues.append("loudness_jump")
+
+        seam_mild = getattr(
+            audio_metrics,
+            "SEAM_MILD_ST",
+            getattr(audio_metrics, "SEAM_DRIFT_ST", 7.0),
+        )
+        has_midturn = (
+            "MIDTURN" in run_acoustic_flags
+            or "MIDDRIFT" in run_acoustic_flags
+            or "INTRA_TURN_SPEAKER_CHANGE" in run_acoustic_flags
+            or "INTRA_TURN_VOICE_DRIFT" in run_acoustic_flags
+            or bool(call_metrics.get("seam_speaker_change_turns"))
+            or bool(call_metrics.get("seam_drift_turns"))
+        )
+        if not has_midturn:
+            seam_st = call_metrics.get("max_seam_st")
+            if (
+                seam_st is not None
+                and isinstance(seam_st, (int, float))
+                and seam_st >= seam_mild
+            ):
+                has_midturn = True
+                run_acoustic_flags.append("MIDTURN")
+        if has_midturn:
+            run_issues.append("midturn_voice_seam")
+
+        if "TRUNC" in run_acoustic_flags:
+            run_issues.append("audio_truncation")
+
+        acoustic_turns: list[dict[str, Any]] = []
+        drift_by_turn: dict[int, dict[str, Any]] = {}
+        for d in drift_rows:
+            t_num = d.get("turn")
+            if t_num is not None:
+                with contextlib.suppress(ValueError, TypeError):
+                    drift_by_turn[int(t_num)] = d
+
+        for tm in turn_metrics_rows:
+            t_num = tm.get("turn", 0)
+            dr = drift_by_turn.get(t_num, {})
+            t_flags = list(dr.get("flags") or [])
+            t_tts = dr.get("tts") or tm.get("tts") or ""
+            acoustic_turns.append(
+                {
+                    "turn": t_num,
+                    "dur_s": (
+                        round(float(tm["dur_s"]), 2)
+                        if tm.get("dur_s") is not None
+                        else None
+                    ),
+                    "lufs": (
+                        round(float(tm["lufs"]), 1)
+                        if tm.get("lufs") is not None
+                        and not math.isnan(tm["lufs"])
+                        else None
+                    ),
+                    "artic_rate": (
+                        round(float(tm["artic_rate"]), 1)
+                        if tm.get("artic_rate") is not None
+                        and not math.isnan(tm["artic_rate"])
+                        else None
+                    ),
+                    "pitch_hz": (
+                        round(float(tm["f0_median_hz"]), 1)
+                        if tm.get("f0_median_hz") is not None
+                        and not math.isnan(tm["f0_median_hz"])
+                        else None
+                    ),
+                    "max_seam_st": (
+                        round(float(tm["max_seam_st"]), 1)
+                        if tm.get("max_seam_st") is not None
+                        else None
+                    ),
+                    "tts": t_tts,
+                    "flags": t_flags,
+                }
+            )
+
+        drift_reasons: list[str] = []
+        for dr in drift_rows:
+            desc = audio_drift.describe(dr)
+            if desc:
+                drift_reasons.append(f"Turn {dr.get('turn', '?')}: {desc}")
+
+        has_tts_spans = any(bool(x) for x in turn_tts_cache_types)
+        is_measured = bool(
+            call_metrics or drift_rows or turn_metrics_rows or has_tts_spans
+        )
+        if is_measured:
+            is_graded = True
+            suite_measured_acoustic_runs += 1
+            has_acoustic_defect = bool(
+                "tts_cache_seam" in run_issues
+                or "loudness_jump" in run_issues
+                or "midturn_voice_seam" in run_issues
+                or "audio_truncation" in run_issues
+            )
+            if not has_acoustic_defect:
+                suite_clean_acoustic_runs += 1
+            if "tts_cache_seam" in run_issues:
+                suite_seam_runs += 1
+            if "loudness_jump" in run_issues:
+                suite_loud_runs += 1
+            if "midturn_voice_seam" in run_issues:
+                suite_midturn_runs += 1
+            if "audio_truncation" in run_issues:
+                suite_trunc_runs += 1
+
+            if call_metrics.get("lufs_mean") is not None:
+                suite_lufs_means.append(float(call_metrics["lufs_mean"]))
+            if call_metrics.get("rate_mean") is not None:
+                suite_rate_means.append(float(call_metrics["rate_mean"]))
+            if call_metrics.get("f0_median_sd_st") is not None:
+                suite_f0_sds.append(float(call_metrics["f0_median_sd_st"]))
+            if call_metrics.get("max_seam_st") is not None:
+                suite_max_seam_st = max(
+                    suite_max_seam_st, float(call_metrics["max_seam_st"])
+                )
+
+        acoustic_detail = {
+            "measured": is_measured,
+            "lufs_mean": (
+                round(float(call_metrics["lufs_mean"]), 2)
+                if call_metrics.get("lufs_mean") is not None
+                else None
+            ),
+            "lufs_sd": (
+                round(float(call_metrics["lufs_sd"]), 2)
+                if call_metrics.get("lufs_sd") is not None
+                else None
+            ),
+            "max_adj_dlufs": (
+                round(float(call_metrics["max_adj_dlufs"]), 2)
+                if call_metrics.get("max_adj_dlufs") is not None
+                else None
+            ),
+            "rate_mean": (
+                round(float(call_metrics["rate_mean"]), 2)
+                if call_metrics.get("rate_mean") is not None
+                else None
+            ),
+            "rate_cov_pct": (
+                round(float(call_metrics["rate_cov_pct"]), 1)
+                if call_metrics.get("rate_cov_pct") is not None
+                else None
+            ),
+            "f0_median_sd_st": (
+                round(float(call_metrics["f0_median_sd_st"]), 2)
+                if call_metrics.get("f0_median_sd_st") is not None
+                else None
+            ),
+            "max_seam_st": (
+                round(float(call_metrics["max_seam_st"]), 1)
+                if call_metrics.get("max_seam_st") is not None
+                else None
+            ),
+            "flags": sorted(list(set(run_acoustic_flags))),
+            "turns": acoustic_turns,
+            "drift_reasons": drift_reasons,
+            "barge_in_details": barge_in_details,
+        }
+
+        if r.get("verdict_barged_missed"):
+            has_verdict_barged_missed = True
+
+        suite_barge_turns += run_barge_turns
+        if has_barge_in:
+            sessions_with_barge_in += 1
+            is_graded = True
+
+        if has_verdict_barged_missed:
+            run_issues.append("verdict_barged_missed")
+
+        if not agent_utterances and isinstance(r.get("detailed_trace"), list):
+            for entry in r["detailed_trace"]:
+                s_entry = str(entry)
+                if s_entry.startswith("Agent Text:") or s_entry.startswith(
+                    "Agent:"
+                ):
+                    agent_utterances.append(s_entry.split(":", 1)[1].strip())
+                elif s_entry.startswith("User:") or s_entry.startswith(
+                    "Caller:"
+                ):
+                    caller_utterances.append(s_entry.split(":", 1)[1].strip())
+
+        if not agent_utterances and isinstance(r.get("transcript"), str):
+            for line in r["transcript"].splitlines():
+                if line.startswith("Agent:"):
+                    agent_utterances.append(line.split(":", 1)[1].strip())
+                elif line.startswith("Caller:") or line.startswith("User:"):
+                    caller_utterances.append(line.split(":", 1)[1].strip())
+
+        if not agent_utterances and isinstance(r.get("turns"), list):
+            for t in r["turns"]:
+                if not isinstance(t, dict):
+                    continue
+                user_u = (
+                    t.get("user_input")
+                    or t.get("user_text")
+                    or t.get("user_query")
+                )
+                if user_u:
+                    caller_utterances.append(str(user_u).strip())
+                agent_u = t.get("agent_text") or t.get("agent_response")
+                if agent_u:
+                    agent_utterances.append(str(agent_u).strip())
+                for c in t.get("comparisons") or []:
+                    if (
+                        isinstance(c, dict)
+                        and c.get("type") == "text"
+                        and c.get("actual")
+                        and c.get("actual") != "(missed)"
+                    ):
+                        agent_utterances.append(str(c["actual"]).strip())
+
+        early_ack_count = 0
+        early_ack_regex = re.compile(
+            r"^(sure|certainly|of course|absolutely|i understand|"
+            r"i'd be happy to|i can help with that|no problem)[,.]?",
+            re.IGNORECASE,
+        )
+        subagent_transfer_regex = re.compile(
+            r"\b(transferring to|routing to|calling|handing off to|transfer to)"
+            r"\s+([a-zA-Z0-9_-]+_(agent|subagent|flow)|dialogflow|nga)\b"
+            r"|\b(routing agent|subagent)\b",
+            re.IGNORECASE,
+        )
+        directive_leak_regex = re.compile(
+            r"(<no[ _-]?speech>|<thought>|\[pause\]|<silent>|\[internal\]|"
+            r"\bsystem:\s*|\binstruction:\s*)",
+            re.IGNORECASE,
+        )
+        markdown_link_regex = re.compile(
+            r"\[[^\]]+\]\((https?://[^\)]+|\/[^\)]+)\)|\bhttps?://[^\s<>]+",
+            re.IGNORECASE,
+        )
+
+        for u in agent_utterances:
+            words = u.split()
+            if len(words) > 80:
+                run_issues.append("wall_of_text")
+            if early_ack_regex.match(u.strip()):
+                early_ack_count += 1
+            if subagent_transfer_regex.search(u):
+                run_issues.append("subagent_transfer_verbalization")
+            if directive_leak_regex.search(u):
+                run_issues.append("prompt_or_directive_leakage")
+            if markdown_link_regex.search(u):
+                run_issues.append("markdown_link_tts_leakage")
+
+        if early_ack_count >= 2:
+            run_issues.append("early_ack_redundancy")
+
+        trace_str = (
+            " ".join(str(x) for x in (r.get("detailed_trace") or []))
+            + " "
+            + str(r.get("transcript") or "")
+        )
+        transfer_matches = re.findall(
+            r"\b(?:transfer|routing|handoff)\b", trace_str, re.IGNORECASE
+        )
+        if (
+            len(transfer_matches) >= 3
+            or r.get("subagent_ping_pong_loop")
+            or r.get("transfer_loop_count", 0) >= 2
+        ):
+            run_issues.append("subagent_ping_pong_loop")
+
+        caller_text = " ".join(caller_utterances).lower()
+        human_req_keywords = [
+            "human",
+            "representative",
+            "operator",
+            "speak to someone",
+            "talk to someone",
+            "real person",
+            "customer service rep",
+        ]
+        caller_wants_human = (
+            any(k in caller_text for k in human_req_keywords)
+            or "dtmf: 0" in caller_text
+            or "dtmf 0" in caller_text
+            or bool(r.get("dtmf_zero"))
+        )
+        human_req_count = sum(caller_text.count(k) for k in human_req_keywords)
+        if (
+            "dtmf: 0" in caller_text
+            or "dtmf 0" in caller_text
+            or r.get("dtmf_zero")
+        ):
+            human_req_count += 1
+
+        if caller_wants_human or human_req_count > 0:
+            run_issues.append("caller_requested_human")
+            if human_req_count >= 2:
+                has_human_transfer = any(
+                    k in trace_str.lower()
+                    for k in (
+                        "transfertohuman",
+                        "transfertoagent",
+                        "live_agent",
+                        "escalat",
+                        "human_agent",
+                    )
+                )
+                if not has_human_transfer:
+                    run_issues.append("ignored_user")
+
+        unique_run_issues = sorted(list(set(run_issues)))
+        for iss in unique_run_issues:
+            if iss in issue_counts:
+                issue_counts[iss] += 1
+
+        run_status_label = lang_name
+        if is_lang_switch:
+            run_status_label = (
+                "Switch (Mismatch)" if is_mismatch else "Switch (OK)"
+            )
+        elif is_mismatch:
+            run_status_label = f"{lang_name} (Mismatch)"
+
+        summary_txt = ""
+        if isinstance(nat_details, dict) and nat_details.get("summary"):
+            summary_txt = nat_details["summary"]
+        elif is_mismatch:
+            summary_txt = (
+                "Language switch or language adherence mismatch detected."
+            )
+
+        pl_p50 = None
+        conv_pl = r.get("_conv_latency")
+        if isinstance(conv_pl, dict) and conv_pl.get("p50_ms") is not None:
+            pl_p50 = float(conv_pl["p50_ms"])
+
+        eval_type_str = str(r.get("_eval_type", "sim"))
+        eval_name_str = str(r.get("name", f"eval_{idx}"))
+        eval_key = (eval_type_str, eval_name_str)
+        per_eval_run_idx = eval_run_indices.get(eval_key, 0)
+        eval_run_indices[eval_key] = per_eval_run_idx + 1
+
+        row_id = f"conv-{idx}"
+
+        if isinstance(r.get("turns"), int) and r["turns"] > 0:
+            turns_count = r["turns"]
+        elif isinstance(r.get("turns"), list) and r["turns"]:
+            turns_count = len(r["turns"])
+        elif isinstance(conv_pl, dict) and conv_pl.get("total_turns"):
+            turns_count = int(conv_pl["total_turns"])
+        elif isinstance(r.get("turn_traces"), list) and r["turn_traces"]:
+            turns_count = len(r["turn_traces"])
+        elif isinstance(r.get("conversation"), list) and r["conversation"]:
+            turns_count = len(r["conversation"])
+        elif (
+            isinstance(nat_details, dict)
+            and isinstance(nat_details.get("turns"), list)
+            and nat_details["turns"]
+        ):
+            turns_count = len(nat_details["turns"])
+        elif isinstance(r.get("detailed_trace"), list) and r["detailed_trace"]:
+            agent_l = 0
+            user_l = 0
+            for dt in r["detailed_trace"]:
+                for raw_l in str(dt).splitlines():
+                    ls = raw_l.strip()
+                    if ls.startswith("Agent Text:"):
+                        agent_l += 1
+                    elif ls.startswith("User:"):
+                        user_l += 1
+            turns_count = (
+                agent_l if agent_l > 0 else (user_l if user_l > 0 else 1)
+            )
+        else:
+            turns_count = 1
+
+        if isinstance(r.get("llm_turns"), int) and r["llm_turns"] > 0:
+            llm_turns_count = r["llm_turns"]
+        elif isinstance(r.get("llm_calls"), int) and r["llm_calls"] > 0:
+            llm_turns_count = r["llm_calls"]
+        elif (
+            isinstance(conv_pl, dict)
+            and isinstance(conv_pl.get("lat_llm_calls"), list)
+            and conv_pl["lat_llm_calls"]
+        ):
+            llm_turns_count = len(conv_pl["lat_llm_calls"])
+        elif isinstance(r.get("turn_traces"), list) and r["turn_traces"]:
+            llm_span_count = 0
+
+            def _walk_spans(node: Any) -> None:
+                nonlocal llm_span_count
+                if isinstance(node, dict):
+                    nm = str(node.get("name", "")).strip().upper()
+                    if (
+                        nm == "LLM"
+                        or nm.startswith("LLM:")
+                        or nm.startswith("LLM ")
+                    ):
+                        llm_span_count += 1
+                    for ck in ("childSpans", "child_spans", "spans"):
+                        if isinstance(node.get(ck), list):
+                            _walk_spans(node[ck])
+                    root = node.get("rootSpan") or node.get("root_span")
+                    if isinstance(root, dict):
+                        _walk_spans(root)
+                elif isinstance(node, list):
+                    for item in node:
+                        _walk_spans(item)
+
+            _walk_spans(r["turn_traces"])
+            llm_turns_count = (
+                llm_span_count if llm_span_count > 0 else turns_count
+            )
+        elif isinstance(r.get("detailed_trace"), list) and r["detailed_trace"]:
+            dt_llm = 0
+            for dt in r["detailed_trace"]:
+                for raw_l in str(dt).splitlines():
+                    ls = raw_l.strip()
+                    if ls.startswith("Agent Text:") or ls.startswith(
+                        "Tool Call:"
+                    ):
+                        dt_llm += 1
+            llm_turns_count = dt_llm if dt_llm > 0 else turns_count
+        else:
+            llm_turns_count = turns_count
+
+        dur_val = (
+            r.get("duration_s")
+            or r.get("duration")
+            or r.get("duration_seconds")
+        )
+        dur_s = None
+        if dur_val is not None:
+            with contextlib.suppress(ValueError, TypeError):
+                dur_s = float(dur_val)
+
+        pl_max = None
+        if isinstance(conv_pl, dict) and conv_pl.get("max_ms"):
+            with contextlib.suppress(ValueError, TypeError):
+                pl_max = float(conv_pl["max_ms"])
+
+        wer_rounded = None
+        if wer_val is not None:
+            with contextlib.suppress(ValueError, TypeError):
+                wer_rounded = round(float(wer_val), 3)
+
+        audio_checks_detail = []
+        for ck, ck_lbl in check_keys:
+            val = audio_checks_map.get(ck)
+            if val is not None:
+                res_str = str(
+                    val.get("result", "") if isinstance(val, dict) else val
+                ).upper()
+                res = (
+                    "PASS"
+                    if "PASS" in res_str
+                    else ("FAIL" if "FAIL" in res_str else "SKIP")
+                )
+                just = ""
+                if isinstance(val, dict):
+                    just = str(
+                        val.get("justification")
+                        or val.get("reason")
+                        or val.get("details")
+                        or ""
+                    )
+                audio_checks_detail.append(
+                    {
+                        "key": ck,
+                        "label": ck_lbl,
+                        "result": res,
+                        "justification": just,
+                    }
+                )
+
+        conv_factors_detail = []
+        cf_lbl_map = dict(conv_factors_meta)
+        if isinstance(nat_details, dict) and isinstance(
+            nat_details.get("conversation_factors"), list
+        ):
+            for cf in nat_details["conversation_factors"]:
+                if isinstance(cf, dict):
+                    q = cf.get("quality", "")
+                    sc = cf.get("score")
+                    sc_f = None
+                    if sc is not None:
+                        with contextlib.suppress(ValueError, TypeError):
+                            sc_f = float(sc)
+                    just = str(
+                        cf.get("justification") or cf.get("reason") or ""
+                    )
+                    conv_factors_detail.append(
+                        {
+                            "key": q,
+                            "label": cf_lbl_map.get(q, q),
+                            "score": sc_f,
+                            "justification": just,
+                        }
+                    )
+
+        turn_naturalness_detail = []
+        if isinstance(nat_details, dict) and isinstance(
+            nat_details.get("turns"), list
+        ):
+            for i, t in enumerate(nat_details["turns"]):
+                if isinstance(t, dict):
+                    t_idx = (
+                        t.get("turn_number")
+                        or t.get("turn_idx")
+                        or t.get("turn")
+                        or (i + 1)
+                    )
+                    t_sc = t.get("score")
+                    t_sc_f = None
+                    if t_sc is not None:
+                        with contextlib.suppress(ValueError, TypeError):
+                            t_sc_f = float(t_sc)
+                    t_lbl = str(t.get("label") or "")
+                    t_just = str(
+                        t.get("justification") or t.get("reason") or ""
+                    )
+                    low_f = []
+                    for f in t.get("factors") or []:
+                        if isinstance(f, dict):
+                            fq = f.get("quality")
+                            fs = f.get("score")
+                            if fq and fs is not None:
+                                with contextlib.suppress(ValueError, TypeError):
+                                    if float(fs) <= 2:
+                                        low_f.append(fq)
+                    turn_naturalness_detail.append(
+                        {
+                            "turn_index": t_idx,
+                            "score": t_sc_f,
+                            "label": t_lbl,
+                            "justification": t_just,
+                            "low_factors": low_f,
+                        }
+                    )
+
+        transcript_messages = _extract_transcript_messages(r)
+
+        failure_reasons = []
+        if isinstance(r.get("failure_reasons"), list):
+            failure_reasons = [str(fr) for fr in r["failure_reasons"]]
+        elif isinstance(nat_details, dict) and isinstance(
+            nat_details.get("failure_reasons"), list
+        ):
+            failure_reasons = [str(fr) for fr in nat_details["failure_reasons"]]
+
+        if is_graded:
+            graded_runs_count += 1
+
+        run_rows.append(
+            {
+                "id": row_id,
+                "row_id": row_id,
+                "is_graded": bool(is_graded),
+                "intent": run_intent,
+                "eval_name": eval_name_str,
+                "run_num": r.get("run", 1),
+                "run_idx": per_eval_run_idx,
+                "eval_type": eval_type_str,
+                "session_id": r.get("session_id", ""),
+                "passed": bool(r.get("passed")),
+                "outcome": "passed" if bool(r.get("passed")) else "failed",
+                "grade_key": grade_key,
+                "grade_label": grade_label,
+                "score": nat_score,
+                "language": lang_name,
+                "language_switch": is_lang_switch,
+                "language_mismatch": is_mismatch,
+                "language_status_label": run_status_label,
+                "audio_checks_passed": checks_passed,
+                "audio_checks_total": checks_total,
+                "audio_checks_status": (
+                    "PASS"
+                    if (checks_total and checks_passed == checks_total)
+                    else ("FAIL" if checks_total else "N/A")
+                ),
+                "turns_count": turns_count,
+                "llm_turns_count": llm_turns_count,
+                "acoustic_measured": bool(is_measured),
+                "duration_s": dur_s,
+                "pl_p50_ms": pl_p50,
+                "pl_max_ms": pl_max,
+                "barge_turns": run_barge_turns,
+                "max_tts_ms": (
+                    round(run_max_tts_ms, 1) if run_max_tts_ms else None
+                ),
+                "agent_speech_ms": (
+                    round(run_agent_speech_ms, 1)
+                    if run_agent_speech_ms
+                    else None
+                ),
+                "caller_requested_human": bool(caller_wants_human),
+                "wer": wer_rounded,
+                "issue_keys": unique_run_issues,
+                "issue_labels": [
+                    issue_dict[k][0]
+                    for k in unique_run_issues
+                    if k in issue_dict
+                ],
+                "flag_labels": [
+                    issue_short_dict.get(k, issue_dict[k][0])
+                    for k in unique_run_issues
+                    if k in issue_dict
+                ],
+                "summary_text": summary_txt,
+                "failure_reasons": failure_reasons,
+                "audio_checks_detail": audio_checks_detail,
+                "conv_factors_detail": conv_factors_detail,
+                "turn_naturalness_detail": turn_naturalness_detail,
+                "transcript_messages": transcript_messages,
+                "acoustic_detail": acoustic_detail,
+            }
+        )
+        suite_total_turns += turns_count
+        suite_total_llm_turns += llm_turns_count
+
+    mean_nat = (
+        round(sum(nat_scores) / len(nat_scores), 2) if nat_scores else None
+    )
+    mean_gpa = (
+        round(sum(gpa_scores) / len(gpa_scores), 2) if gpa_scores else None
+    )
+    grade_denom = naturalness_runs_count or graded_runs_count
+
+    grade_bands = [
+        {
+            "key": "human_like",
+            "label": "Human-like (4.0–5.0)",
+            "short": "Human-like",
+            "color": "var(--good)",
+            "count": grade_counts["human_like"],
+            "pct": (
+                round(grade_counts["human_like"] / grade_denom * 100)
+                if grade_denom
+                else 0
+            ),
+        },
+        {
+            "key": "transitional",
+            "label": "Transitional (2.5–3.9)",
+            "short": "Transitional",
+            "color": "var(--warn)",
+            "count": grade_counts["transitional"],
+            "pct": (
+                round(grade_counts["transitional"] / grade_denom * 100)
+                if grade_denom
+                else 0
+            ),
+        },
+        {
+            "key": "bot_like",
+            "label": "Bot-like (1.0–2.4)",
+            "short": "Bot-like",
+            "color": "var(--critical)",
+            "count": grade_counts["bot_like"],
+            "pct": (
+                round(grade_counts["bot_like"] / grade_denom * 100)
+                if grade_denom
+                else 0
+            ),
+        },
+    ]
+
+    turn_factors_list = []
+    for k, lbl in turn_factors_meta:
+        scores = turn_factor_scores.get(k, [])
+        m = round(sum(scores) / len(scores), 2) if scores else None
+        col = (
+            "var(--good)"
+            if (m and m >= 4.0)
+            else ("var(--warn)" if (m and m >= 3.0) else "var(--critical)")
+        )
+        turn_factors_list.append(
+            {
+                "key": k,
+                "label": lbl,
+                "mean_score": m,
+                "pct": round(m / 5.0 * 100) if m is not None else 0,
+                "count": len(scores),
+                "low_count": sum(1 for s in scores if s <= 2),
+                "color": col,
+            }
+        )
+
+    conv_factors_list = []
+    for k, lbl in conv_factors_meta:
+        scores = conv_factor_scores.get(k, [])
+        m = round(sum(scores) / len(scores), 2) if scores else None
+        col = (
+            "var(--good)"
+            if (m and m >= 4.0)
+            else ("var(--warn)" if (m and m >= 3.0) else "var(--critical)")
+        )
+        conv_factors_list.append(
+            {
+                "key": k,
+                "label": lbl,
+                "mean_score": m,
+                "pct": round(m / 5.0 * 100) if m is not None else 0,
+                "count": len(scores),
+                "low_count": sum(1 for s in scores if s <= 2),
+                "color": col,
+            }
+        )
+
+    language_bars = []
+    for l_name, cnt in sorted(lang_counts.items(), key=lambda x: -x[1]):
+        m_cnt = lang_mismatches.get(l_name, 0)
+        language_bars.append(
+            {
+                "key": l_name.lower(),
+                "label": l_name,
+                "count": cnt,
+                "pct": round(cnt / total_runs * 100) if total_runs else 0,
+                "mismatch_count": m_cnt,
+                "color": "var(--critical)" if m_cnt > 0 else "var(--good)",
+            }
+        )
+    if total_switches > 0:
+        language_bars.append(
+            {
+                "key": "language_switch",
+                "label": "Language Switch",
+                "count": total_switches,
+                "pct": (
+                    round(total_switches / total_runs * 100)
+                    if total_runs
+                    else 0
+                ),
+                "mismatch_count": mismatch_switches,
+                "color": "var(--critical)"
+                if mismatch_switches > 0
+                else "var(--good)",
+            }
+        )
+
+    audio_checks_list = []
+    for ck, lbl in check_keys:
+        st = check_stats[ck]
+        c_tot = st["total"]
+        c_pass = st["pass"]
+        c_fail = st["fail"]
+        p_pct = round(c_pass / c_tot * 100) if c_tot else 0
+        audio_checks_list.append(
+            {
+                "key": ck,
+                "label": lbl,
+                "pass_count": c_pass,
+                "fail_count": c_fail,
+                "total_count": c_tot,
+                "pct": p_pct,
+                "color": "var(--critical)" if c_fail > 0 else "var(--good)",
+            }
+        )
+
+    issue_bars = []
+    for k, cnt in sorted(issue_counts.items(), key=lambda x: -x[1]):
+        if cnt > 0:
+            lbl, col = issue_dict[k]
+            issue_bars.append(
+                {
+                    "key": k,
+                    "label": lbl,
+                    "count": cnt,
+                    "pct": round(
+                        cnt / (graded_runs_count or total_runs or 1) * 100
+                    ),
+                    "color": col,
+                }
+            )
+
+    intents_count: dict[str, int] = {}
+    for r_row in run_rows:
+        it = r_row.get("intent", "unknown")
+        intents_count[it] = intents_count.get(it, 0) + 1
+    intents_list = [
+        {
+            "key": k,
+            "label": (
+                k.replace("_", " ").replace("-", " ").strip().capitalize()
+                if k != "unknown"
+                else "Unknown"
+            ),
+            "count": c,
+        }
+        for k, c in sorted(intents_count.items(), key=lambda x: -x[1])
+    ]
+    barge_in_rate = round(suite_barge_turns / max(1, suite_total_turns), 3)
+
+    mean_score_str = f"{mean_nat:.2f}" if mean_nat is not None else "—"
+    gpa_str = f"{mean_gpa:.2f}" if mean_gpa is not None else "—"
+    gpa_meta = (
+        f"{graded_runs_count} of {total_runs} runs graded &middot; "
+        f"Mean Naturalness {mean_score_str}/5.0 &middot; GPA {gpa_str} / 4"
+    )
+
+    audio_check_tips = _get_audio_analysis_tooltips()
+    turn_tips, conv_tips, grade_tips = _parse_naturalness_prompt_tooltips()
+    wer_tip = _get_wer_tooltip()
+    acoustic_tips = _get_acoustic_metrics_tooltips()
+    issue_tips = _get_issue_tooltips(
+        audio_check_tips, turn_tips, conv_tips, wer_tip, acoustic_tips
+    )
+
+    acoustic_consistency_pct = (
+        round(suite_clean_acoustic_runs / suite_measured_acoustic_runs * 100)
+        if suite_measured_acoustic_runs
+        else 100
+    )
+    acoustic_summary = {
+        "measured_runs": suite_measured_acoustic_runs,
+        "clean_runs": suite_clean_acoustic_runs,
+        "seam_runs": suite_seam_runs,
+        "loud_runs": suite_loud_runs,
+        "midturn_runs": suite_midturn_runs,
+        "trunc_runs": suite_trunc_runs,
+        "consistency_pct": acoustic_consistency_pct,
+        "mean_lufs": (
+            round(sum(suite_lufs_means) / len(suite_lufs_means), 2)
+            if suite_lufs_means
+            else None
+        ),
+        "mean_artic_rate": (
+            round(sum(suite_rate_means) / len(suite_rate_means), 2)
+            if suite_rate_means
+            else None
+        ),
+        "mean_pitch_sd_st": (
+            round(sum(suite_f0_sds) / len(suite_f0_sds), 2)
+            if suite_f0_sds
+            else None
+        ),
+        "max_seam_st": round(suite_max_seam_st, 1),
+    }
+
+    checks_pass_runs = sum(
+        1 for r_row in run_rows if r_row.get("audio_checks_status") == "PASS"
+    )
+    checks_total_runs = sum(
+        1
+        for r_row in run_rows
+        if r_row.get("audio_checks_status") in ("PASS", "FAIL")
+    )
+    checks_pass_pct = (
+        round(100 * checks_pass_runs / checks_total_runs)
+        if checks_total_runs
+        else None
+    )
+
+    mismatch_runs = sum(
+        1 for r_row in run_rows if r_row.get("language_mismatch") is True
+    )
+    lang_matched_runs = total_runs - mismatch_runs
+    lang_adherence_pct = (
+        round(100 * lang_matched_runs / total_runs) if total_runs else None
+    )
+
+    flagged_runs = sum(
+        1 for r_row in run_rows if len(r_row.get("issue_keys", [])) > 0
+    )
+    clean_issue_runs = total_runs - flagged_runs
+    clean_issue_pct = (
+        round(100 * clean_issue_runs / total_runs) if total_runs else None
+    )
+
+    avg_llm_turns = (
+        round(suite_total_llm_turns / total_runs, 1) if total_runs else 0.0
+    )
+    avg_conv_turns = (
+        round(suite_total_turns / total_runs, 1) if total_runs else 0.0
+    )
+
+    overview_metrics = {
+        "checks_pass_runs": checks_pass_runs,
+        "checks_total_runs": checks_total_runs,
+        "checks_pass_pct": checks_pass_pct,
+        "lang_matched_runs": lang_matched_runs,
+        "lang_mismatch_runs": mismatch_runs,
+        "lang_adherence_pct": lang_adherence_pct,
+        "flagged_runs": flagged_runs,
+        "clean_issue_runs": clean_issue_runs,
+        "clean_issue_pct": clean_issue_pct,
+        "total_llm_turns": suite_total_llm_turns,
+        "avg_llm_turns": avg_llm_turns,
+        "total_conv_turns": suite_total_turns,
+        "avg_conv_turns": avg_conv_turns,
+    }
+
+    for b in grade_bands:
+        b["tip"] = grade_tips.get(b["key"], "")
+    for chk in audio_checks_list:
+        chk["tip"] = audio_check_tips.get(chk["key"], "")
+    for cf in conv_factors_list:
+        cf["tip"] = conv_tips.get(cf["key"], "")
+    for tf in turn_factors_list:
+        tf["tip"] = turn_tips.get(tf["key"], "")
+    for ib in issue_bars:
+        ib["tip"] = issue_tips.get(ib["key"], "")
+
+    tip_grade_dist = (
+        "Distribution of overall conversation naturalness grades across"
+        " evaluated runs. Graded on a 1.0–5.0 scale by Gemini multimodal"
+        " audio/transcript evaluation and mapped to a 4.0 GPA scale (Human-like"
+        " = 4.0, Transitional = 2.0–3.0, Bot-like = 0.0–1.0)."
+    )
+    tip_gpa_sub = (
+        "Mean Naturalness is the average 1.0–5.0 overall_score across graded"
+        " runs. GPA maps each run to a 4.0 scale: ≥4.0 (Human-like) = 4.0,"
+        " 3.5–3.9 = 3.0, 2.5–3.4 (Transitional) = 2.0, 1.5–2.4 = 1.0, <1.5 ="
+        " 0.0."
+    )
+    tip_audio_checks_head = (
+        "Pass rates for multimodal Gemini audio checks (inspecting WAV"
+        " recordings for voice consistency, >20s silence, looping, cutoff, and"
+        " error fallbacks) alongside whole-conversation coherence factors"
+        " (1–5 scale)."
+    )
+    tip_lang_head = (
+        "Compares the routed/configured session language against the language"
+        " spoken by the agent, and tracks whether mid-call caller language"
+        " switches (e.g. English → Spanish) were adhered to without mismatch."
+    )
+    tip_ux_head = (
+        "Ranked frequency of spoken UX defects across all runs, combining low"
+        " naturalness factor scores (≤2/5), failed multimodal audio checks,"
+        " language switch mismatches, slow perceived latency (>2,500 ms), and"
+        " high ASR Word Error Rate (>25%). Click any bar to filter affected"
+        " runs."
+    )
+    tip_turn_head = (
+        "Mean score (1.0 = bot-like, 5.0 = human-like) for each of the 11"
+        " per-turn vocal and linguistic dimensions evaluated across all graded"
+        " agent turns. Flags turns scoring ≤2/5."
+    )
+    tip_conv_head = (
+        "Whole-call coherence ratings (1–5 scale), multimodal WAV recording"
+        " checks (PASS/FAIL), and user speech transcription Word Error Rate"
+        " (WER)."
+    )
+    tip_th_grade = (
+        "Mapped from 1.0–5.0 overall naturalness score: Human-like (≥4.0),"
+        " Transitional (2.5–3.9), or Bot-like (<2.5)."
+    )
+    tip_th_score = (
+        "Overall naturalness score on a 1.0–5.0 scale evaluated across vocal"
+        " and linguistic factors."
+    )
+    tip_th_lang = (
+        "Configured or routed language code vs agent spoken language. Flags"
+        " language switch adherence or mismatches."
+    )
+    tip_th_checks = (
+        "Status of multimodal checks inspecting audio recordings for voice"
+        " drift, silence >20s, loops, cutoff, or error fallbacks."
+    )
+    tip_th_pl = (
+        "Median turn perceived latency (p50 ms) measured from end of caller"
+        " speech to start of agent audio."
+    )
+    tip_th_issues = (
+        "Audio and conversational quality issues flagged across factors,"
+        " checks, language adherence, and latency."
+    )
+
+    tooltips = {
+        "tip_grade_dist": tip_grade_dist,
+        "tip_gpa_sub": tip_gpa_sub,
+        "tip_audio_checks_head": tip_audio_checks_head,
+        "tip_lang_head": tip_lang_head,
+        "tip_ux_head": tip_ux_head,
+        "tip_turn_head": tip_turn_head,
+        "tip_conv_head": tip_conv_head,
+        "tip_th_grade": tip_th_grade,
+        "tip_th_score": tip_th_score,
+        "tip_th_lang": tip_th_lang,
+        "tip_th_checks": tip_th_checks,
+        "tip_th_pl": tip_th_pl,
+        "tip_th_issues": tip_th_issues,
+        "wer_tip": wer_tip,
+        "issue_tips": issue_tips,
+        "grade_tips": grade_tips,
+        "turn_tips": turn_tips,
+        "conv_tips": conv_tips,
+        "audio_check_tips": audio_check_tips,
+        "acoustic_tips": acoustic_tips,
+        "acoustic_consistency": acoustic_tips.get("acoustic_consistency", ""),
+    }
+
+    conv_data_json = json.dumps(
+        {
+            "run_rows": run_rows,
+            "issue_bars": issue_bars,
+            "acoustic_summary": acoustic_summary,
+            "tooltips": tooltips,
+        }
+    ).replace("</", "<\\/")
+
+    if audio_analysis is False:
+        has_audio_analysis = False
+    elif audio_analysis is True:
+        has_audio_analysis = True
+    else:
+        has_audio_analysis = bool(
+            graded_runs_count > 0
+            or total_switches > 0
+            or mismatch_runs > 0
+            or any(
+                r.get("modality") == "audio"
+                or r.get("routed_language")
+                or r.get("language")
+                or r.get("audio_analysis")
+                or r.get("audio_metrics")
+                or r.get("voice_metrics")
+                or r.get("audio_drift")
+                or r.get("naturalness_details")
+                or r.get("naturalness")
+                or r.get("wer") is not None
+                for r in all_runs
+            )
+        )
+
+    return {
+        "total_runs": total_runs,
+        "has_audio_analysis": has_audio_analysis,
+        "graded_runs": graded_runs_count,
+        "naturalness_runs": naturalness_runs_count,
+        "mean_score": mean_nat,
+        "gpa_4": mean_gpa,
+        "gpa_meta": gpa_meta,
+        "grade_bands": grade_bands,
+        "turn_grade_counts": turn_grade_counts,
+        "total_graded_turns": total_graded_turns,
+        "turn_factors": turn_factors_list,
+        "conv_factors": conv_factors_list,
+        "language_bars": language_bars,
+        "audio_checks": audio_checks_list,
+        "acoustic_summary": acoustic_summary,
+        "issue_bars": issue_bars,
+        "intents_list": intents_list,
+        "barge_stats": {
+            "barge_turns": suite_barge_turns,
+            "sessions_with_barge_in": sessions_with_barge_in,
+            "barge_in_rate": barge_in_rate,
+        },
+        "wer_summary": {
+            "mean_wer": (
+                round(sum(wer_vals) / len(wer_vals), 3) if wer_vals else None
+            ),
+            "high_wer_count": high_wer_count,
+            "total_count": len(wer_vals),
+        },
+        "checks_pass_runs": checks_pass_runs,
+        "checks_total_runs": checks_total_runs,
+        "checks_pass_pct": checks_pass_pct,
+        "lang_matched_runs": lang_matched_runs,
+        "lang_mismatch_runs": mismatch_runs,
+        "lang_adherence_pct": lang_adherence_pct,
+        "flagged_runs": flagged_runs,
+        "clean_issue_runs": clean_issue_runs,
+        "clean_issue_pct": clean_issue_pct,
+        "total_llm_turns": suite_total_llm_turns,
+        "avg_llm_turns": avg_llm_turns,
+        "total_conv_turns": suite_total_turns,
+        "avg_conv_turns": avg_conv_turns,
+        "overview_metrics": overview_metrics,
+        "tooltips": tooltips,
+        "conv_data_json": conv_data_json,
+        "run_rows": run_rows,
+    }
+
+
+def _get_audio_analysis_tooltips() -> dict[str, str]:
+    """Extract tooltips dynamically from ANALYSIS_REGISTRY prompts."""
+    tips: dict[str, str] = {}
+    for key, analysis in audio_analysis.ANALYSIS_REGISTRY.items():
+        prompt = analysis.prompt.strip()
+        task_m = re.search(
+            r"#\s*Task\s*\n(.*?)(?=\n#|\Z)", prompt, re.DOTALL | re.IGNORECASE
+        )
+        out_m = re.search(
+            r"#\s*Output\s*\n(.*?)(?=\n#|\Z)", prompt, re.DOTALL | re.IGNORECASE
+        )
+        task_str = " ".join(task_m.group(1).split()) if task_m else ""
+        out_str = " ".join(out_m.group(1).split()) if out_m else ""
+        if task_str and out_str:
+            tips[key] = f"Task: {task_str} Output: {out_str}"
+        elif task_str:
+            tips[key] = task_str
+        else:
+            tips[key] = " ".join(prompt.split())
+    return tips
+
+
+def _parse_naturalness_prompt_tooltips() -> tuple[
+    dict[str, str], dict[str, str], dict[str, str]
+]:
+    """Extract turn and conversation quality tooltips dynamically.
+
+    Parses naturalness_prompts constants and NaturalnessConfig defaults.
+    """
+    turn_tips: dict[str, str] = {}
+    for match in re.finditer(
+        r"[-*]\s*`([^`]+)`\s*[—–-]\s*(.*?)(?=\n[-*]\s*`|\Z)",
+        naturalness_prompts.DEFAULT_TURN_QUALITIES,
+        re.DOTALL,
+    ):
+        q_name = match.group(1).strip()
+        q_desc = " ".join(match.group(2).split())
+        turn_tips[q_name] = q_desc
+
+    cfg = naturalness.NaturalnessConfig()
+    b = cfg.latency_bands_ms
+    turn_tips["perceivedLatency"] = (
+        f"Turn perceived latency rating (bands: <{b[0]}ms = 5, "
+        f"<{b[1]}ms = 4, <{b[2]}ms = 3, <{b[3]}ms = 2, ≥{b[3]}ms = 1)."
+    )
+
+    conv_tips: dict[str, str] = {}
+    for match in re.finditer(
+        r"[-*]\s*`([^`]+)`\s*[—–-]\s*(.*?)(?=\n[-*]\s*`|\Z)",
+        naturalness_prompts.DEFAULT_CONVERSATION_QUALITIES,
+        re.DOTALL,
+    ):
+        q_name = match.group(1).strip()
+        q_desc = " ".join(match.group(2).split())
+        conv_tips[q_name] = q_desc
+
+    grade_tips: dict[str, str] = {}
+    for match in re.finditer(
+        r"[-*]\s*`([^`]+)`\s*[—–-]\s*(.*?)(?=\n[-*]\s*`|\Z)",
+        naturalness_prompts.NATURALNESS_RUBRIC,
+        re.DOTALL,
+    ):
+        lbl = match.group(1).strip()
+        desc = " ".join(match.group(2).split())
+        if lbl == "Human-like":
+            grade_tips["human_like"] = (
+                f"Human-like (≥{cfg.human_like_at_or_above}/5.0, GPA 4.0):"
+                f" {desc}"
+            )
+        elif lbl == "Transitional":
+            grade_tips["transitional"] = (
+                f"Transitional ({cfg.bot_like_below}–"
+                f"{cfg.human_like_at_or_above}/5.0, GPA 2.0–3.0): {desc}"
+            )
+        elif lbl == "Bot-like":
+            grade_tips["bot_like"] = (
+                f"Bot-like (<{cfg.bot_like_below}/5.0, GPA 0.0–1.0): {desc}"
+            )
+
+    return turn_tips, conv_tips, grade_tips
+
+
+def _get_wer_tooltip() -> str:
+    """Extract WER tooltip from audio_transcription module."""
+    doc = audio_transcription.calculate_wer.__doc__ or ""
+    lines = [
+        line.strip()
+        for line in doc.splitlines()
+        if "WER =" in line or "Word Error Rate" in line
+    ]
+    formula = " ".join(lines) if lines else "Word Error Rate"
+    return (
+        f"{formula}. Evaluated by comparing ASR transcripts against Gemini"
+        " reference transcription."
+    )
+
+
+def _get_acoustic_metrics_tooltips() -> dict[str, str]:
+    """Dynamically extract acoustic and voice drift tooltips."""
+    drift_doc = audio_drift.__doc__ or ""
+    metrics_doc = audio_metrics.__doc__ or ""
+
+    def _extract_drift_flag(header_pattern: str) -> str:
+        m = re.search(
+            rf"^\s*{header_pattern}\s+(.*?)(?=\n\s*(?:SEAM|LOUD|TRUNC|MIDTURN)|\n\n|\Z)",
+            drift_doc,
+            re.DOTALL | re.MULTILINE,
+        )
+        return " ".join(m.group(1).split()) if m else ""
+
+    seam_doc = _extract_drift_flag(r"SEAM")
+    loud_doc = _extract_drift_flag(r"LOUD")
+    trunc_doc = _extract_drift_flag(r"TRUNC")
+    midturn_doc = _extract_drift_flag(r"MIDTURN\s*/\s*MIDDRIFT")
+
+    bullets = [
+        " ".join(m.group(1).split()).rstrip(",.")
+        for m in re.finditer(
+            r"^\*\s+(.*?)(?=\n\*\s+|\n\n|\Z)",
+            metrics_doc,
+            re.DOTALL | re.MULTILINE,
+        )
+    ]
+    consistency_summary = (
+        "; ".join(bullets)
+        if bullets
+        else (
+            "integrated loudness (LUFS), articulation rate (syllables/s),"
+            " median pitch (Hz), and within-turn voice seams"
+        )
+    )
+
+    loud_step = getattr(audio_drift, "DEFAULT_LOUD_DB", 3.0)
+    seam_strong = getattr(audio_metrics, "SEAM_SPEAKER_CHANGE_ST", 11.0)
+    seam_mild = getattr(audio_metrics, "SEAM_DRIFT_ST", 7.0)
+    trunc_ratio = getattr(audio_drift, "TRUNC_RATIO", 0.6)
+    trunc_min_syl = getattr(audio_drift, "TRUNC_MIN_SYLLABLES", 8)
+
+    return {
+        "tts_cache_seam": (
+            f"SEAM ({seam_doc})"
+            if seam_doc
+            else (
+                "Triggered when adjacent agent turns transition between cached"
+                " and fresh TTS synthesis (vintage seam)."
+            )
+        ),
+        "loudness_jump": (
+            f"LOUD ({loud_doc})"
+            if loud_doc
+            else (
+                "Triggered when adjacent agent turns exhibit an integrated"
+                f" loudness jump exceeding {loud_step:.1f} dB LUFS."
+            )
+        ),
+        "midturn_voice_seam": (
+            f"MIDTURN / MIDDRIFT ({midturn_doc}; thresholds:"
+            f" ≥{seam_mild:.1f} st drift, ≥{seam_strong:.1f} st speaker change)"
+            if midturn_doc
+            else (
+                "Triggered when median pitch shifts across an intra-turn pause"
+                f" by ≥{seam_mild:.1f} st or ≥{seam_strong:.1f} st."
+            )
+        ),
+        "audio_truncation": (
+            f"TRUNC ({trunc_doc})"
+            if trunc_doc
+            else (
+                "Triggered when agent audio syllable count falls below"
+                f" ratio < {trunc_ratio:.1f} (≥{trunc_min_syl} syllables)."
+            )
+        ),
+        "acoustic_consistency": (
+            f"Signal-level voice consistency ({consistency_summary})."
+        ),
+    }
+
+
+def _get_issue_tooltips(
+    audio_check_tips: dict[str, str],
+    turn_tips: dict[str, str],
+    conv_tips: dict[str, str],
+    wer_tip: str,
+    acoustic_tips: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Derive issue tooltips from prompt-extracted descriptions."""
+    ac_tips = acoustic_tips or _get_acoustic_metrics_tooltips()
+    return {
+        "robotic_delivery": (
+            "Triggered when run is Bot-like or scriptedness ≤2/5"
+            f" ({turn_tips.get('scriptedness', '')})"
+        ),
+        "language_mismatch": (
+            "Triggered when the agent speaks the wrong language, ignores a"
+            " caller's mid-call language switch request, or fails a language"
+            " expectation."
+        ),
+        "voice_drift": (
+            "Triggered when audio check fails"
+            f" ({audio_check_tips.get('agent_voice_consistency', '')})"
+            " or personaConsistency ≤2/5"
+            f" ({conv_tips.get('personaConsistency', '')})."
+        ),
+        "long_pauses": (
+            "Triggered when audio check fails"
+            f" ({audio_check_tips.get('no_long_pauses', '')})"
+            " or perceived latency factor ≤2/5."
+        ),
+        "agent_looping": (
+            "Triggered when audio check fails"
+            f" ({audio_check_tips.get('agent_looping', '')})"
+            " or repetitionAvoidance ≤2/5"
+            f" ({conv_tips.get('repetitionAvoidance', '')})."
+        ),
+        "audio_cutoff": (
+            "Triggered when audio check fails"
+            f" ({audio_check_tips.get('agent_cutoff', '')})."
+        ),
+        "having_trouble": (
+            "Triggered when audio check fails"
+            f" ({audio_check_tips.get('agent_having_trouble', '')})."
+        ),
+        "flat_emotion": (
+            "Triggered when emotion/empathy ≤2/5"
+            f" ({turn_tips.get('emotion', '')})."
+        ),
+        "unnatural_pacing": (
+            f"Triggered when pacing ≤2/5 ({turn_tips.get('pacing', '')})."
+        ),
+        "written_grammar": (
+            "Triggered when grammarStyle or spokenNumbers ≤2/5"
+            f" ({turn_tips.get('grammarStyle', '')})."
+        ),
+        "overlong_turns": (
+            f"Triggered when concision ≤2/5 ({turn_tips.get('concision', '')})."
+        ),
+        "turn_taking": (
+            "Triggered when turnTaking or disfluency ≤2/5"
+            f" ({turn_tips.get('turnTaking', '')})."
+        ),
+        "high_wer": f"Triggered when {wer_tip} exceeds 25%.",
+        "audio_exp_failed": (
+            "Triggered when a custom audio_expectation evaluated against"
+            " recorded WAV files is Not Met."
+        ),
+        "verdict_barged_missed": (
+            "Triggered when a decisive turn (tool call, parameter collection,"
+            " or verdict) was interrupted mid-speech by caller barge-in."
+        ),
+        "wall_of_text": (
+            "Triggered when an agent turn exceeds 12 seconds of speech or 80"
+            " spoken words without pausing for caller input."
+        ),
+        "markdown_link_tts_leakage": (
+            "Triggered when unrendered markdown link syntax (e.g. [text](url))"
+            " or raw web URLs are verbalized in agent TTS audio."
+        ),
+        "prompt_or_directive_leakage": (
+            "Triggered when internal prompt instructions, thoughts, or"
+            " directives (e.g. <thought>, [pause], <no speech>) leak into"
+            " spoken agent audio."
+        ),
+        "early_ack_redundancy": (
+            "Triggered when the agent repeatedly prefaces responses with"
+            " redundant acknowledgments or filler phrases across consecutive"
+            " turns."
+        ),
+        "subagent_transfer_verbalization": (
+            "Triggered when internal architectural subagent or router names"
+            " (e.g. transfer to billing_agent) are verbalized to the caller."
+        ),
+        "subagent_ping_pong_loop": (
+            "Triggered when multiple subagent handoffs occur in a loop or"
+            " ping-pong back and forth within a single conversation."
+        ),
+        "ignored_user": (
+            "Triggered when the caller requests a human representative or"
+            " presses DTMF 0 two or more times without being transferred."
+        ),
+        "caller_requested_human": (
+            "Triggered when the caller requested transfer to a human"
+            " representative or agent."
+        ),
+        "tts_cache_seam": ac_tips.get(
+            "tts_cache_seam",
+            "Triggered when adjacent agent turns transition between cached and"
+            " fresh TTS synthesis (vintage seam).",
+        ),
+        "loudness_jump": ac_tips.get(
+            "loudness_jump",
+            "Triggered when adjacent agent turns exhibit an integrated"
+            " loudness jump exceeding threshold.",
+        ),
+        "midturn_voice_seam": ac_tips.get(
+            "midturn_voice_seam",
+            "Triggered when median pitch shifts abruptly across an intra-turn"
+            " pause.",
+        ),
+        "audio_truncation": ac_tips.get(
+            "audio_truncation",
+            "Triggered when agent audio duration falls well under expected turn"
+            " text.",
+        ),
+    }
+
+
+def _render_suite_audio_analysis(audio_data: dict[str, Any] | None) -> str:
+    """Render Audio Analysis & Quality tab HTML via Jinja2 template macro."""
+    if not isinstance(audio_data, dict) or not audio_data.get(
+        "has_audio_analysis"
+    ):
+        return ""
+    mod = _get_combined_template_module()
+    return str(mod.render_suite_audio(audio_data))
 
 
 def _resolve_conv_trace_dict(
@@ -1367,6 +3830,7 @@ def generate_html_report(
     app_name: str = "",
     wall_clock_s: float | None = None,
     user_agent_extension: str | None = None,
+    audio_analysis: bool | None = None,
 ) -> None:
     """Generate an HTML report and save it locally or upload to GCS.
 
@@ -1429,8 +3893,11 @@ def generate_html_report(
 
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    html = _get_html_head(ts)
-    html += _get_summary_block(
+    suite_audio = _aggregate_suite_audio_analysis(
+        results, [], audio_analysis=audio_analysis
+    )
+
+    overview_html = _get_summary_block(
         passed,
         total,
         errors,
@@ -1440,9 +3907,8 @@ def generate_html_report(
         wall_clock_s,
         suite_pl=suite_pl,
     )
-
-    html += _get_results_table(eval_stats)
-    html += '\n<h2 id="section-sims">Eval Details</h2>\n'
+    overview_html += _get_results_table(eval_stats)
+    overview_html += '\n<h2 id="section-sims">Eval Details</h2>\n'
 
     for name, s in sorted(
         eval_stats.items(), key=lambda x: x[1]["pass"] / max(x[1]["total"], 1)
@@ -1451,22 +3917,26 @@ def generate_html_report(
         is_all_pass = s["pass"] == s["total"]
         cls = "pass-bg" if is_all_pass else "fail-bg"
         passed_str = "true" if is_all_pass else "false"
-        html += (
+        overview_html += (
             f'<div class="eval-card" id="eval-{name}" '
             f'data-passed="{passed_str}">\n'
         )
-        html += (
+        overview_html += (
             f'<div class="eval-header {cls}">'
             f'<span>{_escape(name)} <span class="badge sim">sim</span></span>'
             f"<span>{score}</span></div>\n"
         )
-        html += '<div class="eval-body">\n'
+        overview_html += '<div class="eval-body">\n'
 
         for r in s["runs"]:
-            html += _get_run_detail(r, ces_base, tools_map)
-        html += "</div></div>\n"
+            overview_html += _get_run_detail(r, ces_base, tools_map)
+        overview_html += "</div></div>\n"
 
-    html += "</body></html>"
+    mod = _get_combined_template_module()
+    scaffold = str(
+        mod.render_standalone_report_scaffold(overview_html, suite_audio)
+    )
+    html = f"{_get_html_head(ts)}{scaffold}</body></html>"
 
     if output_path.startswith("gs://"):
         mtls_url = _upload_to_gcs(output_path, html)
@@ -1498,6 +3968,7 @@ def generate_combined_html_report(
     bg_noise_file: str | None = None,
     burst_noise_files: list[str] | None = None,
     traces_dir: str | None = None,
+    audio_analysis: bool | None = None,
 ) -> str:
     """Generate combined HTML report based on results from multiple sources.
 
@@ -1796,6 +4267,14 @@ def generate_combined_html_report(
         else None
     )
 
+    # Suite Audio Analysis & Quality
+    suite_audio = _aggregate_suite_audio_analysis(
+        golden_results=golden_results,
+        sim_results=sim_results,
+        audio_analysis=audio_analysis,
+    )
+    suite_audio_html = _render_suite_audio_analysis(suite_audio)
+
     # Process traces for simulation results to simplify template
     if sim_results:
         for r in sim_results:
@@ -1919,15 +4398,21 @@ def generate_combined_html_report(
         failure_groups=failure_groups
     )
     failure_patterns_html = f_patterns.render()
+    suite_latency_html = (
+        _render_suite_latency_drawer(suite_pl) if suite_pl else ""
+    )
     template = _get_combined_report_template()
     html = template.render(
         failure_patterns_html=failure_patterns_html,
+        suite_latency_html=suite_latency_html,
         suite_pl=suite_pl,
         trend_chart=_prepare_trend_chart(suite_pl.get("turn_trend_buckets", []))
         if suite_pl
         else None,
         _fmt_ms=_fmt_ms,
         _pl_status_cls=_pl_status_cls,
+        suite_audio=suite_audio,
+        suite_audio_html=suite_audio_html,
         ts=ts,
         pct=pct,
         passed=passed,
@@ -1965,7 +4450,7 @@ def generate_combined_html_report(
 
     # Wrap compiled body dynamically in declarative BaseShell scaffold envelope.
     report = report_components.BaseShell(
-        title=f"Combined Eval Report - {ts}",
+        title=f"Eval Report - {ts}",
         body_content=[base_components.Raw(html)],
     )
     html_out = report.render()
@@ -2008,6 +4493,7 @@ def generate_combined_json_report(
     golden_modality: str = "text",
     sim_modality: str = "text",
     sim_wall_clock_s: float | None = None,
+    audio_analysis: bool | None = None,
 ) -> str:
     """Generate a combined JSON report based on results from multiple sources.
 
@@ -2050,6 +4536,12 @@ def generate_combined_json_report(
     total = sum(c["total"] for c in per_type.values())
     passed = sum(c["passed"] for c in per_type.values())
 
+    suite_audio = _aggregate_suite_audio_analysis(
+        golden_results=golden_results,
+        sim_results=sim_results,
+        audio_analysis=audio_analysis,
+    )
+
     report = {
         "schema_version": 1,
         "generated_at": datetime.datetime.now().isoformat(),
@@ -2064,6 +4556,7 @@ def generate_combined_json_report(
             "passed": passed,
             "pass_rate_pct": round(100 * passed / total, 2) if total else 0,
             **per_type,
+            "audio_analysis": suite_audio,
         },
         "results": {
             "golden": _sanitize_for_json(golden_results),
@@ -2182,6 +4675,81 @@ def _compile_callback_results_card(
     )
 
 
+def _build_turn_comparisons(
+    turn: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build the expected/actual comparison rows for one replayed turn.
+
+    Each ``expectation_outcome`` entry pairs an expected element with what was
+    observed. An entry can also carry an *observed* agent response with no
+    expectation at all: this happens when the agent says more than the golden
+    modeled -- e.g. a short filler said before a tool call is matched to the
+    expected reply, and the substantive answer produced after the tool returns
+    is left unmatched. Those observed-only responses must still be rendered,
+    otherwise the report looks like the agent never said them even though the
+    platform recorded and the scorer evaluated the full turn.
+    """
+    comparisons = []
+    for o in turn.get("expectation_outcome", []):
+        exp = o.get("expectation", {})
+        comp = {"outcome": _outcome_str(o.get("outcome"))}
+
+        if "agent_response" in exp:
+            comp["type"] = "text"
+            comp["expected"] = _join_chunk_text(
+                exp["agent_response"].get("chunks", [])
+            )
+            obs = o.get("observed_agent_response", {})
+            comp["actual"] = (
+                _join_chunk_text(obs.get("chunks", [])) if obs else "(missed)"
+            )
+        elif "tool_call" in exp:
+            tc = exp["tool_call"]
+            comp["type"] = "tool_call"
+            comp["expected"] = (
+                tc.get("display_name") or tc.get("tool", "").split("/")[-1]
+            )
+            comp["expected_args"] = tc.get("args", {})
+            obs = o.get("observed_tool_call", {})
+            comp["actual"] = (
+                (obs.get("display_name") or obs.get("tool", "").split("/")[-1])
+                if obs
+                else "(missed)"
+            )
+            comp["actual_args"] = obs.get("args", {}) if obs else {}
+            tir = o.get("toolInvocationResult", {})
+            comp["tool_invocation_score"] = tir.get("parameterCorrectnessScore")
+            comp["tool_invocation_explanation"] = tir.get("explanation")
+        elif "agent_transfer" in exp:
+            at = exp["agent_transfer"]
+            comp["type"] = "transfer"
+            comp["expected"] = at.get(
+                "display_name", at.get("target_agent", "").split("/")[-1]
+            )
+            obs = o.get("observed_agent_transfer", {})
+            comp["actual"] = (
+                obs.get(
+                    "display_name",
+                    obs.get("target_agent", "").split("/")[-1],
+                )
+                if obs
+                else "(missed)"
+            )
+        elif "tool_response" in exp:
+            continue
+        elif o.get("observed_agent_response"):
+            comp["type"] = "text"
+            comp["expected"] = "(none)"
+            comp["actual"] = _join_chunk_text(
+                o["observed_agent_response"].get("chunks", [])
+            )
+        else:
+            continue
+
+        comparisons.append(comp)
+    return comparisons
+
+
 def load_golden_results(
     run_id: str, app_name: str, include: list[str] | None = None
 ) -> list[dict[str, Any]]:
@@ -2248,69 +4816,8 @@ def load_golden_results(
                 "index": i + 1,
                 "semantic_score": sem.get("score"),
                 "semantic_explanation": sem.get("explanation"),
-                "comparisons": [],
+                "comparisons": _build_turn_comparisons(turn),
             }
-            for o in turn.get("expectation_outcome", []):
-                exp = o.get("expectation", {})
-                outcome = _outcome_str(o.get("outcome"))
-                comp = {"outcome": outcome}
-
-                if "agent_response" in exp:
-                    chunks = exp["agent_response"].get("chunks", [])
-                    comp["type"] = "text"
-                    comp["expected"] = (
-                        chunks[0].get("text", "") if chunks else ""
-                    )
-                    obs = o.get("observed_agent_response", {})
-                    comp["actual"] = (
-                        obs.get("chunks", [{}])[0].get("text", "")
-                        if obs
-                        else "(missed)"
-                    )
-                elif "tool_call" in exp:
-                    tc = exp["tool_call"]
-                    comp["type"] = "tool_call"
-                    comp["expected"] = (
-                        tc.get("display_name")
-                        or tc.get("tool", "").split("/")[-1]
-                    )
-                    comp["expected_args"] = tc.get("args", {})
-                    obs = o.get("observed_tool_call", {})
-                    comp["actual"] = (
-                        (
-                            obs.get("display_name")
-                            or obs.get("tool", "").split("/")[-1]
-                        )
-                        if obs
-                        else "(missed)"
-                    )
-                    comp["actual_args"] = obs.get("args", {}) if obs else {}
-                    tir = o.get("toolInvocationResult", {})
-                    comp["tool_invocation_score"] = tir.get(
-                        "parameterCorrectnessScore"
-                    )
-                    comp["tool_invocation_explanation"] = tir.get("explanation")
-                elif "tool_response" in exp:
-                    continue
-                elif "agent_transfer" in exp:
-                    at = exp["agent_transfer"]
-                    comp["type"] = "transfer"
-                    comp["expected"] = at.get(
-                        "display_name",
-                        at.get("target_agent", "").split("/")[-1],
-                    )
-                    obs = o.get("observed_agent_transfer", {})
-                    if obs:
-                        comp["actual"] = obs.get(
-                            "display_name",
-                            obs.get("target_agent", "").split("/")[-1],
-                        )
-                    else:
-                        comp["actual"] = "(missed)"
-                else:
-                    continue
-
-                turn_data["comparisons"].append(comp)
             turns.append(turn_data)
 
         expectations = []
@@ -2594,6 +5101,7 @@ def generate_combined_report_from_dir(
     report_format: str = "html",
     vertex_location: str = "global",
     naturalness: bool | dict[str, Any] | None = None,
+    audio_analysis: bool | None = None,
 ) -> str:
     """Load results from directory and generate a combined report.
 
@@ -2680,6 +5188,7 @@ def generate_combined_report_from_dir(
             capture_agent_audio=capture_agent_audio,
             vertex_location=vertex_location,
             naturalness=naturalness,
+            audio_analysis=bool(audio_analysis),
         )
         sim_results = run_results["simulation"] if "sims" in include else []
         # Map tool results to expected format if needed
@@ -2838,6 +5347,7 @@ def generate_combined_report_from_dir(
             app_name=app_name or "",
             golden_modality=modality,
             sim_modality=modality,
+            audio_analysis=audio_analysis,
         )
 
     actual_path = generate_combined_html_report(
@@ -2851,6 +5361,7 @@ def generate_combined_report_from_dir(
         sim_modality=modality,
         bg_noise_file=bg_noise_file,
         burst_noise_files=burst_noise_files,
+        audio_analysis=audio_analysis,
     )
     return actual_path
 
@@ -2885,6 +5396,7 @@ def run_all_evals(
     capture_agent_audio: bool = False,
     vertex_location: str = "global",
     naturalness: bool | dict[str, Any] | None = None,
+    audio_analysis: bool = False,
     infra_retries: int = 0,
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
@@ -2933,6 +5445,8 @@ def run_all_evals(
         extra_kwargs["retry_parallel"] = retry_parallel
     if retry_cooldown != 60.0:
         extra_kwargs["retry_cooldown"] = retry_cooldown
+    if audio_analysis:
+        extra_kwargs["audio_analysis"] = audio_analysis
     return evals_runner.run_all_evals(
         app_name=app_name,
         modality=modality,

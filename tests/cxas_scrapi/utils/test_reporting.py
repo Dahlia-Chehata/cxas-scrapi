@@ -15,8 +15,10 @@
 
 import datetime
 import importlib.util
+import inspect
 import json
 import os
+import re
 import sys
 import typing
 from unittest.mock import ANY, mock_open, patch
@@ -24,6 +26,9 @@ from unittest.mock import ANY, mock_open, patch
 import pandas as pd
 import pytest
 
+from cxas_scrapi.evals import runner as evals_runner
+from cxas_scrapi.evals.simulation_evals import SimulationEvals
+from cxas_scrapi.prompts import naturalness_prompts
 from cxas_scrapi.utils.eval_utils import (
     COMBINED_REPORT_FILENAME,
     COMBINED_REPORT_JSON_FILENAME,
@@ -31,9 +36,14 @@ from cxas_scrapi.utils.eval_utils import (
 )
 from cxas_scrapi.utils.latency_parser import LatencyParser
 from cxas_scrapi.utils.reporting import (
+    _aggregate_suite_audio_analysis,
+    _build_turn_comparisons,
     _escape,
+    _extract_transcript_messages,
     _fmt_duration,
     _format_trace_line,
+    _get_acoustic_metrics_tooltips,
+    _join_chunk_text,
     _load_sim_test_cases,
     _resolve_tool_name,
     _upload_to_gcs,
@@ -43,6 +53,7 @@ from cxas_scrapi.utils.reporting import (
     generate_html_report,
     run_all_evals,
 )
+from cxas_scrapi.utils.tracing.audio_analysis import ANALYSIS_REGISTRY
 
 
 @patch("cxas_scrapi.utils.reporting.gcs_utils.GCSUtils")
@@ -204,6 +215,95 @@ def test_escape() -> None:
     assert _escape('<script>&"') == "&lt;script&gt;&amp;&quot;"
 
 
+def test_join_chunk_text() -> None:
+    # Multi-chunk turn (filler said before a tool call, then the answer
+    # after it returns) must render every chunk, not just the first.
+    assert _join_chunk_text(
+        [
+            {"text": "Thanks. Checking that now."},
+            {"text": "You're verified. The amount due is $4,120.80."},
+        ]
+    ) == (
+        "Thanks. Checking that now. "
+        "You're verified. The amount due is $4,120.80."
+    )
+    # Single chunk is unchanged.
+    assert _join_chunk_text([{"text": "hello"}]) == "hello"
+    # Empty / missing input.
+    assert _join_chunk_text([]) == ""
+    assert _join_chunk_text(None) == ""
+    # Blank and text-less chunks are skipped, not rendered as gaps.
+    assert _join_chunk_text([{"text": "  "}, {}, {"text": "kept"}]) == "kept"
+    assert _join_chunk_text([{"text": None}]) == ""
+
+
+def test_build_turn_comparisons_renders_unmatched_observed_response() -> None:
+    # Real shape of a turn where the agent emitted a filler before a tool
+    # call and the substantive answer after it. The platform matches the
+    # filler to the expected reply (entry 0) and records the substantive
+    # answer as an observed response with NO expectation (entry 3). The
+    # renderer must surface both, not drop the unmatched one.
+    turn = {
+        "expectation_outcome": [
+            {
+                "expectation": {
+                    "agent_response": {
+                        "chunks": [
+                            {"text": "Thanks. Checking now. You're set."}
+                        ]
+                    }
+                },
+                "observed_agent_response": {
+                    "chunks": [{"text": "Thanks. Checking now."}]
+                },
+                "outcome": 2,
+            },
+            {
+                "expectation": {
+                    "tool_call": {"display_name": "verify_caller", "args": {}}
+                },
+                "observed_tool_call": {"display_name": "verify_caller"},
+                "outcome": 1,
+            },
+            {
+                "expectation": {"tool_response": {}},
+                "outcome": 1,
+            },
+            {
+                "observed_agent_response": {
+                    "chunks": [{"text": "You're verified. $4,120.80 is due."}]
+                },
+                "outcome": 0,
+            },
+        ]
+    }
+
+    comps = _build_turn_comparisons(turn)
+
+    # tool_response entry is skipped; the other three render.
+    assert len(comps) == 3
+    assert comps[0]["type"] == "text"
+    assert comps[0]["actual"] == "Thanks. Checking now."
+    assert comps[1]["type"] == "tool_call"
+    assert comps[1]["actual"] == "verify_caller"
+    # The unmatched observed answer is surfaced, not dropped.
+    assert comps[2]["type"] == "text"
+    assert comps[2]["expected"] == "(none)"
+    assert comps[2]["actual"] == "You're verified. $4,120.80 is due."
+
+    # Also assert that _extract_transcript_messages surfaces the full
+    # conversation from turns with comparisons
+    messages = _extract_transcript_messages(
+        {"turns": [{"user_input": "What is my balance?", "comparisons": comps}]}
+    )
+    assert messages == [
+        ["caller", "What is my balance?"],
+        ["agent", "Thanks. Checking now."],
+        ["event", "Tool Call: verify_caller"],
+        ["agent", "You're verified. $4,120.80 is due."],
+    ]
+
+
 def test_resolve_tool_name() -> None:
     tools_map = {"projects/p/tools/t1": "MyTool"}
     assert _resolve_tool_name("projects/p/tools/t1", tools_map) == "MyTool"
@@ -304,7 +404,7 @@ def test_generate_combined_html_report(tmp_path: typing.Any) -> None:
     assert os.path.exists(output_path)
     with open(output_path) as f:
         content = f.read()
-        assert "Combined Eval Report" in content
+        assert "Eval Report" in content
         assert "test_golden" in content
         assert "test_sim" in content
         assert "test_tool" in content
@@ -473,7 +573,7 @@ def test_generate_combined_report_from_dir(tmp_path: typing.Any) -> None:
     assert os.path.exists(output_path)
     with open(output_path) as f:
         content = f.read()
-        assert "Combined Eval Report" in content
+        assert "Eval Report" in content
         assert "test_sim" in content
         assert "test_tool" in content
         assert "test_callback" in content
@@ -770,7 +870,7 @@ def test_generate_combined_report_from_dir_html_default_unchanged(
 
     assert resolved_path == str(evals_dir / COMBINED_REPORT_FILENAME)
     with open(resolved_path) as f:
-        assert "Combined Eval Report" in f.read()
+        assert "Eval Report" in f.read()
 
 
 @patch("cxas_scrapi.evals.runner.Evaluations")
@@ -1375,7 +1475,7 @@ def test_generate_combined_report_from_dir_timestamped(
 
     with open(expected_output_path) as f:
         content = f.read()
-        assert "Combined Eval Report" in content
+        assert "Eval Report" in content
         assert "test_sim" in content
         assert "test_tool" in content
         assert "test_callback" in content
@@ -1879,6 +1979,563 @@ def test_perceived_latency_standalone_tts_and_barge_in_fallback() -> None:
     assert round(bd_barged["tts_ms"]) == 500
 
 
+def test_audio_analysis_tab_naturalness_and_grades(
+    tmp_path: typing.Any,
+) -> None:
+    run1 = {
+        "name": "sim_1",
+        "run": 1,
+        "passed": True,
+        "naturalness_details": {
+            "overall_score": 4.5,
+            "overall_label": "Human-like",
+            "turns": [
+                {
+                    "label": "Human-like",
+                    "factors": [
+                        {"quality": "emotion", "score": 4.5},
+                        {"quality": "pacing", "score": 4.0},
+                    ],
+                }
+            ],
+            "conversation_factors": [
+                {"quality": "personaConsistency", "score": 5.0}
+            ],
+        },
+    }
+    run2 = {
+        "name": "sim_2",
+        "run": 1,
+        "passed": True,
+        "naturalness_details": {
+            "overall_score": 3.2,
+            "overall_label": "Transitional",
+            "turns": [
+                {
+                    "label": "Transitional",
+                    "factors": [
+                        {"quality": "emotion", "score": 3.0},
+                        {"quality": "pacing", "score": 3.5},
+                    ],
+                }
+            ],
+        },
+    }
+    run3 = {
+        "name": "sim_3",
+        "run": 1,
+        "passed": False,
+        "naturalness_details": {
+            "overall_score": 1.8,
+            "overall_label": "Bot-like",
+            "turns": [
+                {
+                    "label": "Bot-like",
+                    "factors": [
+                        {"quality": "scriptedness", "score": 1.5},
+                        {"quality": "emotion", "score": 2.0},
+                    ],
+                }
+            ],
+        },
+    }
+
+    # Direct aggregation check
+    agg = _aggregate_suite_audio_analysis(sim_results=[run1, run2, run3])
+    assert agg["total_runs"] == 3
+    assert agg["graded_runs"] == 3
+    assert agg["mean_score"] == pytest.approx(3.17, 0.05)
+    assert agg["turn_grade_counts"]["Human-like"] == 1
+    assert agg["turn_grade_counts"]["Transitional"] == 1
+    assert agg["turn_grade_counts"]["Bot-like"] == 1
+
+    out_html = tmp_path / "combined.html"
+    generate_combined_html_report(
+        sim_results=[run1, run2, run3], output_path=str(out_html)
+    )
+    html_content = out_html.read_text(encoding="utf-8")
+
+    assert "tab-panel-quality" in html_content
+    assert "report-tabs-nav" in html_content
+    assert "switchReportTab('quality'" in html_content
+    assert "Audio &amp; Conversation Quality" in html_content
+    assert "Grade distribution" in html_content
+    assert "Human-like" in html_content
+    assert "Transitional" in html_content
+    assert "Bot-like" in html_content
+    assert 'data-grade="human_like"' in html_content
+    assert 'data-grade="transitional"' in html_content
+    assert 'data-grade="bot_like"' in html_content
+    assert "tip-badge" in html_content
+    assert "data-tip=" in html_content
+    assert (
+        "Did the agent correctly read the user" in html_content
+        or "emotional state and respond" in html_content
+    )
+    assert "Is the agent the same person throughout" in html_content
+
+
+def test_audio_analysis_tab_language_switch_and_mismatch(
+    tmp_path: typing.Any,
+) -> None:
+    run1 = {
+        "name": "run_en",
+        "run": 1,
+        "passed": True,
+        "routed_language": "en",
+        "transcript": "Hello, how can I help you today?",
+    }
+    run2 = {
+        "name": "run_es",
+        "run": 1,
+        "passed": True,
+        "language": "es",
+        "transcript": "Hola, gracias por llamar.",
+    }
+    run3 = {
+        "name": "run_sw_ok",
+        "run": 1,
+        "passed": True,
+        "language_switch": {"requested_language": "es", "adhered": True},
+    }
+    run4 = {
+        "name": "run_sw_fail",
+        "run": 1,
+        "passed": False,
+        "language_switch": {
+            "requested_language": "es",
+            "adhered": False,
+            "mismatch": True,
+        },
+        "naturalness_details": {
+            "failure_reasons": [
+                "Agent stayed in English after user requested Spanish"
+            ]
+        },
+    }
+
+    agg = _aggregate_suite_audio_analysis(sim_results=[run1, run2, run3, run4])
+    assert agg["total_runs"] == 4
+    lang_keys = [lb["key"] for lb in agg["language_bars"]]
+    assert "english" in lang_keys
+    assert "spanish" in lang_keys
+    assert "language_switch" in lang_keys
+
+    # Check language switch mismatch
+    sw_bar = next(
+        lb for lb in agg["language_bars"] if lb["key"] == "language_switch"
+    )
+    assert sw_bar["count"] == 2
+    assert sw_bar["mismatch_count"] == 1
+
+    out_html = tmp_path / "combined.html"
+    generate_combined_html_report(
+        sim_results=[run1, run2, run3, run4], output_path=str(out_html)
+    )
+    html_content = out_html.read_text(encoding="utf-8")
+
+    assert "Language &amp; language switch" in html_content
+    assert "filterAudioRunsByLang" in html_content
+    assert 'data-mismatch="true"' in html_content
+    assert "language_mismatch" in html_content
+
+
+def test_audio_analysis_tab_multimodal_audio_checks_and_issues(
+    tmp_path: typing.Any,
+) -> None:
+    run1 = {
+        "name": "audio_pass",
+        "run": 1,
+        "passed": True,
+        "audio_analysis": {
+            "agent_voice_consistency": {"result": "PASS"},
+            "no_long_pauses": {"result": "PASS"},
+            "agent_having_trouble": {"result": "PASS"},
+            "agent_looping": {"result": "PASS"},
+            "agent_cutoff": {"result": "PASS"},
+        },
+        "naturalness_details": {
+            "overall_score": 4.5,
+            "factor_averages": {
+                "pacing": 4.5,
+                "emotion": 4.0,
+            },
+            "turns": [
+                {
+                    "label": "Human-like",
+                    "factors": [
+                        {"quality": "pacing", "score": 5},
+                        {"quality": "emotion", "score": 4},
+                    ],
+                }
+            ],
+            "conversation_factors": [
+                {"quality": "coherence", "score": 5},
+                {"quality": "conversational_flow", "score": 4},
+            ],
+        },
+        "wer": 0.04,
+    }
+    run2 = {
+        "name": "audio_fail",
+        "run": 1,
+        "passed": False,
+        "audio_analysis": {
+            "agent_voice_consistency": {"result": "FAIL"},
+            "no_long_pauses": {"result": "FAIL"},
+            "agent_having_trouble": {"result": "FAIL"},
+            "agent_looping": {"result": "FAIL"},
+            "agent_cutoff": {"result": "FAIL"},
+        },
+        "naturalness_details": {
+            "overall_score": 2.0,
+            "factor_averages": {
+                "pacing": 2.0,
+                "emotion": 1.5,
+            },
+            "turns": [
+                {
+                    "label": "Bot-like",
+                    "factors": [
+                        {"quality": "pacing", "score": 2},
+                        {"quality": "emotion", "score": 1},
+                    ],
+                }
+            ],
+            "conversation_factors": [
+                {"quality": "coherence", "score": 2},
+                {"quality": "conversational_flow", "score": 2},
+            ],
+        },
+        "wer": 0.35,
+    }
+
+    agg = _aggregate_suite_audio_analysis(sim_results=[run1, run2])
+    checks_map = {c["key"]: c for c in agg["audio_checks"]}
+    for ck in [
+        "agent_voice_consistency",
+        "no_long_pauses",
+        "agent_having_trouble",
+        "agent_looping",
+        "agent_cutoff",
+    ]:
+        assert checks_map[ck]["pass_count"] == 1
+        assert checks_map[ck]["fail_count"] == 1
+        assert checks_map[ck]["total_count"] == 2
+
+    assert agg["wer_summary"]["high_wer_count"] == 1
+    assert agg["wer_summary"]["total_count"] == 2
+
+    issue_keys = [ib["key"] for ib in agg["issue_bars"]]
+    for expected_issue in [
+        "voice_drift",
+        "long_pauses",
+        "having_trouble",
+        "agent_looping",
+        "audio_cutoff",
+        "high_wer",
+    ]:
+        assert expected_issue in issue_keys
+
+    out_html = tmp_path / "sim_report.html"
+    generate_html_report(
+        [run1, run2], str(out_html), modality="audio", model="gemini-2.5-flash"
+    )
+    html_content = out_html.read_text(encoding="utf-8")
+
+    assert "tab-panel-quality" in html_content
+    assert "Audio checks &amp; flow" in html_content
+    assert "filterAudioRunsByIssue" in html_content
+    assert "data-issues=" in html_content
+    assert "audio_cutoff" in html_content
+    assert "tip-badge" in html_content
+    assert "data-tip=" in html_content
+    # Tooltip text pulled from ANALYSIS_REGISTRY
+    assert (
+        "determine if all the audio files are from the same speaker"
+        in html_content
+    )
+    assert "pauses longer than 20 seconds" in html_content
+    assert "repeats the same sentence or phrase multiple times" in html_content
+    assert "agent_voice_consistency" in ANALYSIS_REGISTRY
+
+    # Tooltip text pulled from naturalness_prompts
+    assert "Did the agent correctly read the user" in html_content
+    assert "Conversational rhythm" in html_content
+    assert "emotion" in naturalness_prompts.DEFAULT_TURN_QUALITIES
+
+
+def test_audio_analysis_in_combined_json_report(tmp_path: typing.Any) -> None:
+    golden_results = [
+        {
+            "name": "g1",
+            "run": 1,
+            "passed": True,
+            "modality": "audio",
+            "naturalness_details": {"overall_score": 4.2},
+        }
+    ]
+    sim_results = [
+        {
+            "name": "s1",
+            "run": 1,
+            "passed": False,
+            "naturalness_details": {"overall_score": 2.1},
+            "audio_analysis": {"no_long_pauses": {"result": "FAIL"}},
+        }
+    ]
+
+    out_json = tmp_path / "combined.json"
+    generate_combined_json_report(
+        golden_results=golden_results,
+        sim_results=sim_results,
+        output_path=str(out_json),
+    )
+    data = json.loads(out_json.read_text(encoding="utf-8"))
+
+    assert "audio_analysis" in data["summary"]
+    audio_summary = data["summary"]["audio_analysis"]
+    assert audio_summary["total_runs"] == 2
+    assert audio_summary["graded_runs"] == 2
+    assert audio_summary["mean_score"] == pytest.approx(3.15, 0.05)
+    assert len(audio_summary["grade_bands"]) == 3
+    assert len(audio_summary["run_rows"]) == 2
+    assert audio_summary["run_rows"][0]["eval_type"] == "golden"
+    assert audio_summary["run_rows"][1]["eval_type"] == "sim"
+    assert "long_pauses" in audio_summary["run_rows"][1]["issue_keys"]
+
+
+def test_audio_conversations_section_and_drawer(tmp_path: typing.Any) -> None:
+    sim_run = {
+        "name": "order_lookup_sim",
+        "run": 1,
+        "passed": True,
+        "modality": "audio",
+        "routed_language": "en",
+        "latency_p50": 340,
+        "_conv_latency": {"p50_ms": 340.0},
+        "wer": 0.03,
+        "audio_analysis": {
+            "agent_voice_consistency": {
+                "result": "PASS",
+                "details": "Single speaker tone detected.",
+            },
+            "no_long_pauses": {
+                "result": "PASS",
+                "details": "No abnormal latency.",
+            },
+        },
+        "naturalness_details": {
+            "overall_score": 4.6,
+            "overall_label": "Human-like",
+            "turns": [
+                {
+                    "turn_index": 1,
+                    "label": "Human-like",
+                    "score": 4.5,
+                    "justification": "Clear and natural speech rhythm.",
+                    "factors": [
+                        {"quality": "pacing", "score": 4.5},
+                        {"quality": "emotion", "score": 4.7},
+                    ],
+                }
+            ],
+            "conversation_factors": [
+                {
+                    "quality": "coherence",
+                    "score": 4.8,
+                    "justification": "Followed topic accurately.",
+                }
+            ],
+        },
+        "transcript": [
+            {"role": "caller", "text": "Can I check my order status?"},
+            {
+                "role": "agent",
+                "text": "Certainly, let me pull up that information.",
+            },
+        ],
+        "duration_seconds": 24.5,
+        "duration_s": 24.5,
+    }
+
+    golden_run = {
+        "name": "billing_issue_golden",
+        "run": 2,
+        "passed": False,
+        "modality": "audio",
+        "routed_language": "es",
+        "language_switch": True,
+        "language_mismatch": True,
+        "failure_reasons": ["Responded in English instead of Spanish"],
+        "latency_p50": 980,
+        "_conv_latency": {"p50_ms": 980.0},
+        "wer": 0.28,
+        "audio_analysis": {
+            "agent_voice_consistency": {
+                "result": "PASS",
+                "details": "Consistent speaker timbre.",
+            },
+            "no_long_pauses": {
+                "result": "FAIL",
+                "details": "Extended silence detected between turns.",
+            },
+            "agent_having_trouble": {
+                "result": "FAIL",
+                "details": "Agent requested clarification repeatedly.",
+            },
+        },
+        "naturalness_details": {
+            "overall_score": 2.2,
+            "overall_label": "Bot-like",
+            "turns": [
+                {
+                    "turn_index": 1,
+                    "label": "Bot-like",
+                    "score": 2.0,
+                    "justification": "Robotic tone and delayed response.",
+                    "factors": [
+                        {"quality": "pacing", "score": 2.0},
+                        {"quality": "scriptedness", "score": 1.8},
+                    ],
+                }
+            ],
+            "conversation_factors": [
+                {
+                    "quality": "coherence",
+                    "score": 2.5,
+                    "justification": "Conversation flow was broken.",
+                }
+            ],
+        },
+        "transcript": (
+            "Caller: Necesito ayuda con mi factura.\n"
+            "Agent: Sorry, please repeat your account number."
+        ),
+        "duration_seconds": 58.2,
+        "duration_s": 58.2,
+    }
+
+    # 1. Combined report
+    out_comb = tmp_path / "combined_convs.html"
+    generate_combined_html_report(
+        golden_results=[golden_run],
+        sim_results=[sim_run],
+        output_path=str(out_comb),
+    )
+    comb_html = out_comb.read_text(encoding="utf-8")
+
+    # Nav tab for Conversations
+    assert "switchReportTab('conversations')" in comb_html
+    assert 'id="tab-conv-n">2</span>' in comb_html
+
+    # Conversations section
+    assert '<section id="conversations"' in comb_html
+    assert 'data-tab="conversations"' in comb_html
+    assert 'id="audio-conv-search"' in comb_html
+    assert 'id="audio-facets"' in comb_html
+    assert 'id="audio-active-filters"' in comb_html
+    assert 'id="audio-runs-table"' in comb_html
+    assert 'id="audio-conv-pager"' in comb_html
+    assert 'id="audio-conv-scrim"' in comb_html
+    assert 'id="audio-conv-drawer"' in comb_html
+
+    # Facet groups rendered in initial HTML
+    assert 'data-g="outcome"' in comb_html
+    assert 'data-g="grade"' in comb_html
+    assert 'data-g="type"' in comb_html
+    assert 'data-g="lang"' in comb_html
+    assert 'data-g="checks"' in comb_html
+    assert 'data-g="issue"' in comb_html
+
+    # Sortable columns
+    assert 'class="sortable" data-sort="run"' in comb_html
+    assert 'class="sortable" data-sort="eval"' in comb_html
+    assert 'class="sortable" data-sort="type"' in comb_html
+    assert 'class="sortable" data-sort="outcome"' in comb_html
+    assert 'class="sortable" data-sort="grade"' in comb_html
+    assert 'class="sortable r" data-sort="score"' in comb_html
+    assert 'class="sortable" data-sort="lang"' in comb_html
+    assert 'class="sortable" data-sort="checks"' in comb_html
+    assert 'class="sortable r" data-sort="turns"' in comb_html
+    assert 'class="sortable r" data-sort="latency"' in comb_html
+    assert 'class="sortable r" data-sort="wer"' in comb_html
+    assert "Flags / Issues" in comb_html
+
+    # Table rows with pre-rendered data attributes
+    assert 'class="audio-run-row clickable"' in comb_html
+    assert 'data-row-id="conv-0"' in comb_html
+    assert 'data-row-id="conv-1"' in comb_html
+    assert 'data-outcome="passed"' in comb_html
+    assert 'data-outcome="failed"' in comb_html
+    assert 'data-grade="human_like"' in comb_html
+    assert 'data-grade="bot_like"' in comb_html
+    assert 'data-type="sim"' in comb_html
+    assert 'data-type="golden"' in comb_html
+    assert 'data-checks="PASS"' in comb_html
+    assert 'data-checks="FAIL"' in comb_html
+
+    # Drawer container elements
+    assert 'id="dr-h"' in comb_html
+    assert 'id="dr-b"' in comb_html
+    assert 'id="dr-f"' in comb_html
+    assert "stepAudioConv(-1)" in comb_html
+    assert "navigator.clipboard.writeText" in comb_html
+    assert "switchReportTab('overview')" in comb_html
+
+    # Serialized JSON data blob
+    assert 'id="audio-conv-data"' in comb_html
+    json_match = re.search(
+        r'<script type="application/json" id="audio-conv-data">\s*(\{.*?\})\s*</script>',
+        comb_html,
+        re.DOTALL,
+    )
+    assert json_match is not None
+    embedded_data = json.loads(json_match.group(1))
+    assert "run_rows" in embedded_data
+    assert len(embedded_data["run_rows"]) == 2
+
+    # Check transcript and detail normalization in embedded data
+    rows = {r["row_id"]: r for r in embedded_data["run_rows"]}
+    # In generate_combined_html_report, golden_results are passed first then sim_results
+    assert len(rows["conv-1"]["transcript_messages"]) == 2
+    assert rows["conv-1"]["transcript_messages"][0][0] == "caller"
+    assert "order status" in rows["conv-1"]["transcript_messages"][0][1]
+    sim_checks = {c["key"]: c for c in rows["conv-1"]["audio_checks_detail"]}
+    assert sim_checks["agent_voice_consistency"]["result"] == "PASS"
+
+    assert len(rows["conv-0"]["transcript_messages"]) == 2
+    assert rows["conv-0"]["failure_reasons"] == [
+        "Responded in English instead of Spanish"
+    ]
+    gld_checks = {c["key"]: c for c in rows["conv-0"]["audio_checks_detail"]}
+    assert gld_checks["no_long_pauses"]["result"] == "FAIL"
+    assert (
+        "Extended silence detected"
+        in gld_checks["no_long_pauses"]["justification"]
+    )
+
+    # 2. Standalone simulation report
+    out_sim = tmp_path / "sim_convs.html"
+    generate_html_report(
+        [sim_run],
+        str(out_sim),
+        modality="audio",
+        model="gemini-2.5-flash",
+    )
+    sim_html = out_sim.read_text(encoding="utf-8")
+    assert 'id="report-nav"' in sim_html
+    assert 'id="tab-overview"' in sim_html
+    assert 'id="tab-quality"' in sim_html
+    assert 'id="tab-conversations"' in sim_html
+    assert "switchReportTab('conversations'" in sim_html
+    assert 'id="tab-conv-n">1</span>' in sim_html
+    assert '<section id="conversations"' in sim_html
+    assert 'id="audio-runs-table"' in sim_html
+    assert 'id="audio-conv-drawer"' in sim_html
+    assert 'id="audio-conv-data"' in sim_html
+
+
 def test_perceived_latency_redesigned_dashboard_and_tabs(
     tmp_path: typing.Any,
 ) -> None:
@@ -2050,3 +2707,734 @@ def test_perceived_latency_redesigned_dashboard_and_tabs(
     assert '<span class="pl-arrow">&#9654;</span>' in html
     assert "Table A: Pre-Speech Component Breakdown" in html
     assert "Callback Time Decomposition" in html
+
+
+def test_audio_analysis_phase1_metrics_and_intent_filter(
+    tmp_path: typing.Any,
+) -> None:
+    # 1. Run with barge-in during decisive tool call, wall of text TTS, markdown link, prompt leakage
+    run1 = {
+        "name": "sim_refund_flow",
+        "file_name": "evals/goldens/refund_policy.json",
+        "run": 1,
+        "passed": False,
+        "modality": "audio",
+        "turn_traces": [
+            {
+                "rootSpan": {
+                    "name": "Turn 1",
+                    "childSpans": [
+                        {
+                            "name": "AGENT: triage",
+                            "childSpans": [
+                                {
+                                    "name": "TTS",
+                                    "attributes": {
+                                        "audio duration (ms)": 14000.0
+                                    },
+                                    "duration": "14.0s",
+                                }
+                            ],
+                        },
+                        {
+                            "name": "VAD: speech_detected",
+                            "attributes": {"barge-in": True},
+                        },
+                        {
+                            "name": "TOOL: process_refund",
+                            "attributes": {"tool": "process_refund"},
+                        },
+                    ],
+                },
+                "parts": [
+                    {
+                        "role": "agent",
+                        "text": (
+                            "Certainly! Please visit [help portal]"
+                            "(https://example.com/help) <no speech> for more"
+                            " info."
+                        ),
+                    },
+                    {
+                        "role": "caller",
+                        "text": "I want to speak with a human agent please.",
+                    },
+                ],
+            },
+            {
+                "rootSpan": {
+                    "name": "Turn 2",
+                    "childSpans": [],
+                },
+                "parts": [
+                    {
+                        "role": "agent",
+                        "text": (
+                            "Certainly! I am transferring to billing_subagent"
+                            " now."
+                        ),
+                    },
+                    {
+                        "role": "caller",
+                        "text": (
+                            "Operator, give me a real person or human"
+                            " representative now."
+                        ),
+                    },
+                ],
+            },
+        ],
+        "detailed_trace": [
+            "routing to billing_agent",
+            "handoff to support_flow",
+            "transfer to billing_subagent",
+        ],
+    }
+
+    # 2. Run with second intent
+    run2 = {
+        "name": "sim_tech_support",
+        "source_file": "evals/sims/tech_support.yaml",
+        "run": 1,
+        "passed": True,
+        "modality": "audio",
+        "turn_traces": [
+            {
+                "rootSpan": {
+                    "name": "Turn 1",
+                    "childSpans": [
+                        {
+                            "name": "TTS",
+                            "duration": "2.0s",
+                        }
+                    ],
+                },
+                "parts": [
+                    {
+                        "role": "agent",
+                        "text": (
+                            "Hello, how can I assist you with your equipment"
+                            " today?"
+                        ),
+                    }
+                ],
+            }
+        ],
+    }
+
+    agg = _aggregate_suite_audio_analysis(sim_results=[run1, run2])
+    assert agg["total_runs"] == 2
+    assert agg["barge_stats"]["barge_turns"] == 1
+    assert agg["barge_stats"]["sessions_with_barge_in"] == 1
+
+    # Verify intent extraction in intents_list
+    intent_keys = [it["key"] for it in agg["intents_list"]]
+    assert "refund_policy" in intent_keys
+    assert "tech_support" in intent_keys
+
+    # Verify per-run fields
+    r1 = next(r for r in agg["run_rows"] if r["eval_name"] == "sim_refund_flow")
+    assert r1["intent"] == "refund_policy"
+    assert r1["barge_turns"] == 1
+    assert r1["max_tts_ms"] == 14000.0
+    assert r1["caller_requested_human"] is True
+
+    # Verify Phase 1 issue keys on run 1
+    r1_issues = r1["issue_keys"]
+    assert "verdict_barged_missed" in r1_issues
+    assert "wall_of_text" in r1_issues
+    assert "markdown_link_tts_leakage" in r1_issues
+    assert "prompt_or_directive_leakage" in r1_issues
+    assert "early_ack_redundancy" in r1_issues
+    assert "subagent_transfer_verbalization" in r1_issues
+    assert "subagent_ping_pong_loop" in r1_issues
+    assert "caller_requested_human" in r1_issues
+    assert "ignored_user" in r1_issues
+
+    # Generate combined HTML report and verify template rendering
+    out_html = tmp_path / "combined_phase1.html"
+    generate_combined_html_report(
+        sim_results=[run1, run2], output_path=str(out_html)
+    )
+    html_content = out_html.read_text(encoding="utf-8")
+
+    # Intent filter wrap and buttons
+    assert 'id="intent-wrap"' in html_content
+    assert 'id="intent-btn"' in html_content
+    assert 'data-g="intent"' in html_content
+    assert 'data-gv="refund_policy"' in html_content
+    assert 'data-gv="tech_support"' in html_content
+    assert "{'key':" not in html_content
+
+    # Barge-In bar and flags
+    assert "Caller Barge-In &amp; Interruption Rate" in html_content
+    assert "verdict_barged_missed" in html_content
+    assert "wall_of_text" in html_content
+    assert "markdown_link_tts_leakage" in html_content
+    assert "prompt_or_directive_leakage" in html_content
+    assert "early_ack_redundancy" in html_content
+    assert "subagent_transfer_verbalization" in html_content
+    assert "subagent_ping_pong_loop" in html_content
+    assert "caller_requested_human" in html_content
+    assert "ignored_user" in html_content
+
+
+def test_acoustic_metrics_tooltips() -> None:
+    tips = _get_acoustic_metrics_tooltips()
+    expected_keys = {
+        "tts_cache_seam",
+        "loudness_jump",
+        "midturn_voice_seam",
+        "audio_truncation",
+        "acoustic_consistency",
+    }
+    assert expected_keys.issubset(tips.keys())
+    assert "3.0" in tips["loudness_jump"] or "dB" in tips["loudness_jump"]
+    assert (
+        "7.0" in tips["midturn_voice_seam"]
+        or "11.0" in tips["midturn_voice_seam"]
+    )
+    assert "vintage seam" in tips["tts_cache_seam"]
+    assert (
+        "0.6" in tips["audio_truncation"]
+        or "syllable" in tips["audio_truncation"]
+    )
+
+
+def test_audio_analysis_acoustic_metrics_and_drift_aggregation(
+    tmp_path: typing.Any,
+) -> None:
+    run1 = {
+        "name": "sim_acoustic_good",
+        "run": 1,
+        "passed": True,
+        "modality": "audio",
+        "audio_metrics": {
+            "call": {
+                "lufs_mean": -21.4,
+                "lufs_sd": 0.8,
+                "max_adj_dlufs": 1.2,
+                "rate_mean": 4.2,
+                "rate_cov_pct": 8.5,
+                "f0_median_sd_st": 1.1,
+                "max_seam_st": 3.2,
+                "flags": [],
+            },
+            "turns": [
+                {
+                    "turn": 1,
+                    "dur_s": 2.4,
+                    "lufs": -21.0,
+                    "artic_rate": 4.1,
+                    "f0_median_hz": 180.0,
+                    "max_seam_st": 2.1,
+                    "tts": "fresh",
+                },
+                {
+                    "turn": 2,
+                    "dur_s": 3.1,
+                    "lufs": -21.8,
+                    "artic_rate": 4.3,
+                    "f0_median_hz": 182.0,
+                    "max_seam_st": 3.2,
+                    "tts": "fresh",
+                },
+            ],
+        },
+    }
+
+    run2 = {
+        "name": "sim_acoustic_drift_and_jump",
+        "run": 1,
+        "passed": False,
+        "modality": "audio",
+        "audio_metrics": {
+            "call": {
+                "lufs_mean": -24.0,
+                "lufs_sd": 3.2,
+                "max_adj_dlufs": 4.8,
+                "rate_mean": 3.8,
+                "rate_cov_pct": 14.0,
+                "f0_median_sd_st": 3.5,
+                "max_seam_st": 12.4,
+                "flags": ["max_adj_dlufs", "intra_turn_speaker_change"],
+            },
+            "turns": [],
+        },
+        "audio_drift": [
+            {
+                "turn": 2,
+                "flags": ["SEAM", "LOUD", "MIDTURN", "TRUNC"],
+                "tts": "cached",
+                "dlufs": 4.8,
+                "dur_s": 1.2,
+                "n_syl": 3,
+                "agent_text": "Thank you for reaching customer support today.",
+            }
+        ],
+    }
+
+    run3 = {
+        "name": "sim_tts_cache_transition_spans",
+        "run": 1,
+        "passed": True,
+        "modality": "audio",
+        "turn_traces": [
+            {
+                "rootSpan": {
+                    "name": "Turn 1",
+                    "childSpans": [
+                        {
+                            "name": "TTS",
+                            "attributes": {
+                                "cache hit": True,
+                                "time to first audio (ms)": 12.0,
+                            },
+                        }
+                    ],
+                }
+            },
+            {
+                "rootSpan": {
+                    "name": "Turn 2",
+                    "childSpans": [
+                        {
+                            "name": "TTS",
+                            "attributes": {
+                                "cache hit": False,
+                                "time to first audio (ms)": 380.0,
+                            },
+                        }
+                    ],
+                }
+            },
+        ],
+    }
+
+    suite_audio = _aggregate_suite_audio_analysis(
+        sim_results=[run1, run2, run3], golden_results=[]
+    )
+    ac_sum = suite_audio["acoustic_summary"]
+    assert ac_sum["measured_runs"] == 3
+    assert ac_sum["clean_runs"] == 1
+    assert ac_sum["loud_runs"] == 1
+    assert ac_sum["midturn_runs"] == 1
+    assert ac_sum["trunc_runs"] == 1
+    assert ac_sum["seam_runs"] == 2
+
+    # Check run rows
+    rows = suite_audio["run_rows"]
+    r1, r2, r3 = rows[0], rows[1], rows[2]
+    assert r1["acoustic_detail"]["measured"] is True
+    assert "loudness_jump" not in r1["issue_keys"]
+
+    assert r2["acoustic_detail"]["measured"] is True
+    assert "loudness_jump" in r2["issue_keys"]
+    assert "tts_cache_seam" in r2["issue_keys"]
+    assert "midturn_voice_seam" in r2["issue_keys"]
+    assert "audio_truncation" in r2["issue_keys"]
+
+    assert "tts_cache_seam" in r3["issue_keys"]
+
+    # Generate combined HTML report and verify template rendering
+    out_html = tmp_path / "combined_acoustic.html"
+    generate_combined_html_report(
+        sim_results=[run1, run2, run3], output_path=str(out_html)
+    )
+    html_text = out_html.read_text(encoding="utf-8")
+    assert "Acoustic Signal Consistency" in html_text
+    assert "tts_cache_seam" in html_text
+    assert "loudness_jump" in html_text
+    assert "midturn_voice_seam" in html_text
+    assert "audio_truncation" in html_text
+
+
+def test_audio_analysis_barge_in_eval_fields(tmp_path: typing.Any) -> None:
+    run = {
+        "name": "sim_barge_in_evaluation",
+        "run": 1,
+        "passed": True,
+        "modality": "audio",
+        "step_details": [
+            {
+                "turn": "turn_1",
+                "goal": "Inquire account balance",
+                "status": "SUCCESS",
+            },
+            {
+                "turn": "turn_2",
+                "goal": "Interrupt agent before confirmation finishes",
+                "status": "SUCCESS",
+                "barge_in_after_ms": 1500,
+                "agent_interrupted": True,
+                "barge_in_awareness_injected": True,
+                "vad_barge_in": True,
+                "vad_skip_reason": None,
+                "barge_in_metadata": {
+                    "interrupted": True,
+                    "played_audio_duration_ms": 1520.0,
+                    "total_audio_duration_ms": 4200.0,
+                },
+            },
+        ],
+    }
+
+    suite_audio = _aggregate_suite_audio_analysis(
+        sim_results=[run], golden_results=[]
+    )
+    row = suite_audio["run_rows"][0]
+    assert row["barge_turns"] == 1
+    b_evs = row["acoustic_detail"]["barge_in_details"]
+    assert len(b_evs) == 1
+    ev = b_evs[0]
+    assert ev["step"] == "turn_2"
+    assert ev["barge_in_after_ms"] == 1500
+    assert ev["agent_interrupted"] is True
+    assert ev["vad_barge_in"] is True
+    assert ev["played_audio_duration_ms"] == 1520.0
+    assert ev["total_audio_duration_ms"] == 4200.0
+
+    out_html = tmp_path / "combined_barge.html"
+    generate_combined_html_report(sim_results=[run], output_path=str(out_html))
+    html_text = out_html.read_text(encoding="utf-8")
+    assert "Caller Barge-In &amp; Interruption Rate" in html_text
+
+
+def test_audio_analysis_overview_tiles_and_intent_actions(
+    tmp_path: typing.Any,
+) -> None:
+    run1 = {
+        "name": "sim_check_pass",
+        "run": 1,
+        "passed": True,
+        "modality": "audio",
+        "audio_analysis": {
+            "agent_voice_consistency": {"result": "PASS"},
+            "no_long_pauses": {"result": "PASS"},
+        },
+        "audio_checks": {
+            "overall_status": "PASS",
+            "passed": 2,
+            "failed": 0,
+            "checks": [],
+        },
+        "audio_acoustic": {
+            "lufs_mean": -19.5,
+            "pitch_hz_mean": 180.0,
+            "speech_rate_sps": 4.1,
+            "max_adj_dlufs": 1.2,
+            "max_seam_st": 0.5,
+            "flags": [],
+        },
+        "audio_metrics": {
+            "lufs_mean": -19.5,
+            "pitch_hz_mean": 180.0,
+            "speech_rate_sps": 4.1,
+            "max_adj_dlufs": 1.2,
+            "max_seam_st": 0.5,
+            "flags": [],
+        },
+        "_conv_latency": {"p50_ms": 1100.0},
+        "duration_s": 15.0,
+        "naturalness": "4.5/5",
+        "naturalness_label": "Human-like",
+        "naturalness_details": {
+            "overall_score": 4.5,
+            "overall_label": "Human-like",
+            "latency_ms_by_turn": {"0": 1100.0},
+        },
+        "language_mismatch": False,
+        "wer": 0.04,
+        "transcription_wer": 0.04,
+        "intent": "account_balance",
+        "turn_traces": [_make_sample_turn_trace(with_filler=False)],
+    }
+    run2 = {
+        "name": "sim_check_fail",
+        "run": 1,
+        "passed": False,
+        "modality": "audio",
+        "audio_analysis": {
+            "agent_voice_consistency": {"result": "FAIL"},
+            "no_long_pauses": {"result": "PASS"},
+        },
+        "audio_checks": {
+            "overall_status": "FAIL",
+            "passed": 1,
+            "failed": 2,
+            "checks": [],
+        },
+        "audio_acoustic": {
+            "lufs_mean": -26.0,
+            "pitch_hz_mean": 210.0,
+            "speech_rate_sps": 5.5,
+            "max_adj_dlufs": 5.8,
+            "max_seam_st": 8.0,
+            "flags": ["max_adj_dlufs"],
+        },
+        "audio_metrics": {
+            "lufs_mean": -26.0,
+            "pitch_hz_mean": 210.0,
+            "speech_rate_sps": 5.5,
+            "max_adj_dlufs": 5.8,
+            "max_seam_st": 8.0,
+            "flags": ["max_adj_dlufs"],
+        },
+        "_conv_latency": {"p50_ms": 2600.0},
+        "duration_s": 22.0,
+        "naturalness": "2.1/5",
+        "naturalness_label": "Bot-like",
+        "naturalness_details": {
+            "overall_score": 2.1,
+            "overall_label": "Bot-like",
+            "latency_ms_by_turn": {"0": 2600.0},
+        },
+        "language_mismatch": True,
+        "wer": 0.18,
+        "transcription_wer": 0.18,
+        "intent": "transfer_funds",
+        "turn_traces": [
+            {
+                "rootSpan": {
+                    "name": "Turn 1",
+                    "childSpans": [
+                        {
+                            "name": "TTS",
+                            "attributes": {
+                                "cache hit": True,
+                                "time to first audio (ms)": 20.0,
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+        "step_details": [
+            {
+                "turn": "turn_1",
+                "goal": "Transfer money",
+                "status": "SUCCESS",
+                "barge_in_after_ms": 1200,
+                "agent_interrupted": True,
+                "barge_in_awareness_injected": True,
+                "vad_barge_in": True,
+                "barge_in_metadata": {
+                    "interrupted": True,
+                    "played_audio_duration_ms": 1200.0,
+                    "total_audio_duration_ms": 3000.0,
+                },
+            }
+        ],
+    }
+
+    suite_audio = _aggregate_suite_audio_analysis(
+        sim_results=[run1, run2], golden_results=[]
+    )
+    ov = suite_audio.get("overview_metrics")
+    assert ov is not None
+    assert ov["checks_total_runs"] == 2
+    assert ov["checks_pass_runs"] == 1
+    assert ov["checks_pass_pct"] == 50
+    assert ov["lang_matched_runs"] == 1
+    assert ov["lang_mismatch_runs"] == 1
+    assert ov["lang_adherence_pct"] == 50
+    assert ov["flagged_runs"] >= 1
+    assert ov["total_llm_turns"] >= 2
+    assert ov["avg_llm_turns"] >= 1.0
+    assert suite_audio["checks_pass_pct"] == 50
+    assert suite_audio["lang_adherence_pct"] == 50
+    assert suite_audio["run_rows"][0]["llm_turns_count"] >= 1
+    assert suite_audio["run_rows"][0]["acoustic_measured"] is True
+
+    out_html = tmp_path / "combined_overview_tiles.html"
+    generate_combined_html_report(
+        sim_results=[run1, run2],
+        output_path=str(out_html),
+        app_name="projects/p/locations/l/apps/a",
+    )
+    html_text = out_html.read_text(encoding="utf-8")
+
+    assert 'id="overview-tiles"' in html_text
+    assert 'class="tiles overview-tiles"' in html_text
+    assert 'id="ov-tile-nat"' in html_text
+    assert "Audio Naturalness" in html_text
+    assert 'id="ov-tile-human"' in html_text
+    assert "Human-like Runs" in html_text
+    assert 'id="ov-tile-pl"' in html_text
+    assert "Perceived Latency" in html_text
+    assert 'id="ov-tile-slo"' in html_text
+    assert 'id="ov-tile-llm-turns"' in html_text
+    assert "Avg # LLM Turns" in html_text
+    assert 'id="ov-tile-checks"' in html_text
+    assert "Audio Checks" in html_text
+    assert 'id="ov-tile-acoustic"' in html_text
+    assert "Acoustic Consistency" in html_text
+    assert 'id="ov-tile-wer"' in html_text
+    assert "Transcription WER" in html_text
+    assert 'id="ov-tile-lang"' in html_text
+    assert "Language Adherence" in html_text
+    assert 'id="ov-tile-barge"' in html_text
+    assert "Caller Barge-In Rate" in html_text
+
+    # Tab navigation numbers
+    assert 'id="tab-overview-n"' in html_text
+    assert 'id="tab-audio-n"' in html_text
+    assert 'id="tab-conv-n"' in html_text
+
+    assert "selectAllIntents" in html_text
+    assert "intent-master-cb" in html_text
+    assert "masterCb.indeterminate = someChecked" in html_text
+
+
+def test_audio_analysis_opt_in_gating_and_flags(tmp_path: typing.Any) -> None:
+    text_run1 = {
+        "name": "text_sim_1",
+        "run": 1,
+        "passed": True,
+        "modality": "text",
+        "intent": "check_balance",
+        "transcript": [
+            {"role": "user", "text": "What is my balance?"},
+            {"role": "agent", "text": "Your balance is $50."},
+        ],
+    }
+    text_run2 = {
+        "name": "text_sim_2",
+        "run": 2,
+        "passed": False,
+        "modality": "text",
+        "intent": "check_balance",
+        "transcript": [
+            {"role": "user", "text": "Transfer money"},
+            {"role": "agent", "text": "How much?"},
+        ],
+    }
+    audio_run = {
+        "name": "audio_sim_1",
+        "run": 1,
+        "passed": True,
+        "modality": "audio",
+        "intent": "audio_check",
+        "naturalness_details": {
+            "overall_score": 4.5,
+            "overall_label": "Human-like",
+            "turns": [],
+        },
+        "audio_analysis": {
+            "agent_voice_consistency": {
+                "result": "PASS",
+                "details": "Consistent tone detected.",
+            }
+        },
+        "transcript": [
+            {"role": "caller", "text": "Hello audio"},
+            {"role": "agent", "text": "Hi there!"},
+        ],
+    }
+
+    # 1. Text-only runs with default (None): has_audio_analysis must be False
+    suite_audio_text = _aggregate_suite_audio_analysis(
+        sim_results=[text_run1, text_run2], golden_results=[]
+    )
+    assert suite_audio_text["has_audio_analysis"] is False
+    assert suite_audio_text["total_runs"] == 2
+
+    # Generated HTML report for text-only must NOT render Audio Analysis tab or audio tiles
+    text_html_path = tmp_path / "text_only_report.html"
+    generate_combined_html_report(
+        sim_results=[text_run1, text_run2],
+        output_path=str(text_html_path),
+        app_name="projects/p/locations/l/apps/a",
+    )
+    text_html = text_html_path.read_text(encoding="utf-8")
+    assert '<button type="button" data-tab="quality"' not in text_html
+    assert 'id="tab-quality"' not in text_html
+    assert 'id="ov-tile-nat"' not in text_html
+    assert 'id="ov-tile-human"' not in text_html
+    assert 'id="ov-tile-checks"' not in text_html
+    assert 'id="ov-tile-acoustic"' not in text_html
+    assert 'id="ov-tile-wer"' not in text_html
+    assert 'id="ov-tile-lang"' not in text_html
+    assert 'id="ov-tile-barge"' not in text_html
+    # Conversations tab and LLM turns tile should still be present
+    assert 'data-tab="conversations"' in text_html
+    assert 'id="ov-tile-llm-turns"' in text_html
+
+    # 2. Audio run with explicit audio_analysis=False: suppresses has_audio_analysis
+    suite_audio_suppressed = _aggregate_suite_audio_analysis(
+        sim_results=[audio_run], golden_results=[], audio_analysis=False
+    )
+    assert suite_audio_suppressed["has_audio_analysis"] is False
+
+    suppressed_html_path = tmp_path / "suppressed_audio_report.html"
+    generate_combined_html_report(
+        sim_results=[audio_run],
+        output_path=str(suppressed_html_path),
+        app_name="projects/p/locations/l/apps/a",
+        audio_analysis=False,
+    )
+    suppressed_html = suppressed_html_path.read_text(encoding="utf-8")
+    assert '<button type="button" data-tab="quality"' not in suppressed_html
+    assert 'id="tab-quality"' not in suppressed_html
+    assert 'id="ov-tile-nat"' not in suppressed_html
+
+    # 3. Audio run with default/None or True: has_audio_analysis must be True
+    suite_audio_enabled = _aggregate_suite_audio_analysis(
+        sim_results=[audio_run], golden_results=[], audio_analysis=True
+    )
+    assert suite_audio_enabled["has_audio_analysis"] is True
+
+    enabled_html_path = tmp_path / "enabled_audio_report.html"
+    generate_combined_html_report(
+        sim_results=[audio_run],
+        output_path=str(enabled_html_path),
+        app_name="projects/p/locations/l/apps/a",
+        audio_analysis=True,
+    )
+    enabled_html = enabled_html_path.read_text(encoding="utf-8")
+    assert '<button type="button" data-tab="quality"' in enabled_html
+    assert 'id="tab-quality"' in enabled_html
+    assert 'id="ov-tile-nat"' in enabled_html
+
+    # 4. Standalone report: verify gating logic in render_standalone_report_scaffold
+    standalone_text_path = tmp_path / "standalone_text.html"
+    generate_html_report(
+        [text_run1, text_run2],
+        str(standalone_text_path),
+        "text",
+        "gemini-test",
+    )
+    standalone_text = standalone_text_path.read_text(encoding="utf-8")
+    assert 'id="tab-quality"' not in standalone_text
+    assert 'data-tab="conversations"' in standalone_text
+
+    standalone_audio_path = tmp_path / "standalone_audio.html"
+    generate_html_report(
+        [audio_run],
+        str(standalone_audio_path),
+        "audio",
+        "gemini-test",
+        audio_analysis=False,
+    )
+    standalone_audio = standalone_audio_path.read_text(encoding="utf-8")
+    assert 'id="tab-quality"' not in standalone_audio
+
+    standalone_audio_enabled_path = tmp_path / "standalone_audio_enabled.html"
+    generate_html_report(
+        [audio_run],
+        str(standalone_audio_enabled_path),
+        "audio",
+        "gemini-test",
+        audio_analysis=True,
+    )
+    standalone_audio_enabled = standalone_audio_enabled_path.read_text(
+        encoding="utf-8"
+    )
+    assert 'id="tab-quality"' in standalone_audio_enabled
+
+    # 5. Verify SimulationEvals and run_all_evals defaults
+    sim_evals = SimulationEvals(app_name="projects/p/locations/l/apps/a")
+    assert sim_evals.audio_analysis is False
+
+    sig = inspect.signature(evals_runner.run_all_evals)
+    assert sig.parameters["audio_analysis"].default is False

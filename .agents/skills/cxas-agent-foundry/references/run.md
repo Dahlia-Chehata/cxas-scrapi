@@ -129,6 +129,14 @@ All commands support `--priority P0` and `--tag <tag>`.
 **For a combined HTML report:**
 ```bash
 cxas evals report --output-dir <project>/eval-reports/
+
+# Include comprehensive Audio Analysis (opt-in; off by default)
+cxas evals report \
+  --run \
+  --app-name "$APP_NAME" \
+  --modality audio \
+  --audio-analysis \
+  --output-dir <project>/eval-reports/
 ```
 
 **For an interactive diagnostic dashboard (dynamic parameter filters & LLM failure clustering):**

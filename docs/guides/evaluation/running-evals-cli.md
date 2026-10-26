@@ -155,6 +155,55 @@ echo "All evaluations passed!"
 
 ---
 
+## Combined Evaluation Reports (`cxas evals report`)
+
+The `cxas evals report` command runs evaluations across multiple types (simulations, goldens, tool tests, callback tests) and compiles them into a unified interactive HTML or machine-readable JSON report.
+
+### CLI Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--output-dir` | *(required)* | Directory containing or receiving evaluation results (`sim_results.json`, etc.) |
+| `--output` | `combined_eval_report.html` | Custom destination file path (local or `gs://` bucket URI) |
+| `--format` | `html` | Output format: `html` or `json` |
+| `--run` | `False` | Trigger execution of evaluations before generating report |
+| `--app-name` | `None` | CXAS app resource path (`projects/.../locations/.../apps/...`) |
+| `--include` | `sims,goldens,tools,callbacks` | Comma-separated evaluation types to run/include |
+| `--modality` | `text` | Evaluation modality: `text` or `audio` |
+| `--sim-parallel` | `5` | Concurrency worker count for simulations |
+| `--runs` | `1` | Number of runs per test case |
+| `--audio-analysis` / `--no-audio-analysis` | `None` | Opt-in flag to run comprehensive audio analysis (multimodal audio checks, acoustic metrics, voice drift) and include the Audio Analysis tab. Off by default. |
+| `--naturalness` / `--no-naturalness` | `None` | Run-level override for the naturalness metric. `--naturalness` grades every simulation; `--no-naturalness` skips grading; omitting it defers to each test case YAML. |
+| `--capture-agent-audio` | `False` | Capture real-time agent output audio as WAV files for turn listening |
+| `--single-bidi-stream` | `False` | Keep one persistent bidi WebSocket open per audio simulation |
+| `--use-tool-fakes` | `False` | Enable tool fakes (bypass real tool backends) |
+
+---
+
+## Audio Analysis & Voice Quality Reports
+
+For voice and audio agents, `cxas evals report` supports deep perceptual and acoustic analysis via the `--audio-analysis` flag:
+
+```bash
+cxas evals report \
+  --run \
+  --app-name "$APP" \
+  --modality audio \
+  --audio-analysis \
+  --output-dir "eval-reports"
+```
+
+When `--audio-analysis` is enabled (opt-in; off by default):
+1. **Multimodal Audio Checks**: Evaluates 5 Gemini perceptual checks (voice consistency, no long pauses, agent having trouble, agent looping, agent cutoff) directly against conversation turn audio.
+2. **Signal-Level Acoustic Consistency**: Calculates ITU-R BS.1770 integrated loudness (LUFS), articulation rate (syllables/sec), median pitch (F0 in Hz and semitones), and within-turn loudness range.
+3. **Voice Drift & Seam Detection**: Detects cross-turn timbre and pitch seams, abrupt loudness steps, audio truncation, and cached-versus-fresh TTS boundaries.
+4. **Naturalness Grading**: Automatically activates the 5-point naturalness rubric across all conversation runs.
+5. **Interactive Report Tabs**: Generates the **Audio Analysis** tab with KPI summary tiles, distribution charts, and issue breakdowns, alongside the **Conversations** run explorer.
+
+When `--audio-analysis` is omitted (or `--no-audio-analysis` is specified), the report suppresses audio-specific KPI tiles and the Audio Analysis tab, rendering a clean text-focused report while keeping the interactive Conversations explorer available.
+
+---
+
 ## GitHub Actions integration
 
 Use `cxas init-github-action` to generate a pre-built GitHub Actions workflow with Workload Identity Federation authentication.
