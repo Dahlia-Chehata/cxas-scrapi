@@ -1315,6 +1315,77 @@ def test_e002_non_golden_skipped(
     assert len(results) == 0
 
 
+def test_e003_unknown_tool_call(
+    tmp_path: typing.Any, context: typing.Any
+) -> None:
+    from cxas_scrapi.utils.lint_rules.evals import InvalidToolCall  # noqa: PLC0415,I001
+
+    rule = InvalidToolCall()
+    goldens_dir = tmp_path / "goldens"
+    goldens_dir.mkdir()
+    f = goldens_dir / "test.yaml"
+    f.write_text(
+        "conversations:\n"
+        "  - conversation: test1\n"
+        "    turns:\n"
+        "      - user: hi\n"
+        "        agent: hello\n"
+        "        tool_calls:\n"
+        "          - action: nonexistent_tool\n"
+    )
+
+    results = rule.check(f, f.read_text(), context)
+    assert len(results) == 1
+    assert results[0].rule_id == "E003"
+    assert "nonexistent_tool" in results[0].message
+
+
+def test_e003_valid_and_special_tool_calls_ok(
+    tmp_path: typing.Any, context: typing.Any
+) -> None:
+    from cxas_scrapi.utils.lint_rules.evals import InvalidToolCall  # noqa: PLC0415,I001
+
+    rule = InvalidToolCall()
+    goldens_dir = tmp_path / "goldens"
+    goldens_dir.mkdir()
+    f = goldens_dir / "test.yaml"
+    f.write_text(
+        "conversations:\n"
+        "  - conversation: test1\n"
+        "    turns:\n"
+        "      - user: hi\n"
+        "        agent: hello\n"
+        "        tool_calls:\n"
+        "          - action: get_balance\n"
+        "          - action: transfer_to_agent\n"
+        "          - action: end_session\n"
+    )
+
+    results = rule.check(f, f.read_text(), context)
+    assert len(results) == 0
+
+
+def test_e003_non_golden_skipped(
+    tmp_path: typing.Any, context: typing.Any
+) -> None:
+    from cxas_scrapi.utils.lint_rules.evals import InvalidToolCall  # noqa: PLC0415,I001
+
+    rule = InvalidToolCall()
+    f = tmp_path / "simulations" / "test.yaml"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(
+        "conversations:\n"
+        "  - conversation: test1\n"
+        "    turns:\n"
+        "      - user: hi\n"
+        "        tool_calls:\n"
+        "          - action: nonexistent_tool\n"
+    )
+
+    results = rule.check(f, f.read_text(), context)
+    assert len(results) == 0
+
+
 def test_e005_duplicate_keys(tmp_path: typing.Any, context: typing.Any) -> None:
     from cxas_scrapi.utils.lint_rules.evals import DuplicateYamlKeys  # noqa: PLC0415,I001
 
@@ -2044,6 +2115,31 @@ def test_s003_callback_file_missing(
     assert "greet.py" in results[0].message
 
 
+def test_s003_agent_and_tool_callbacks_missing(
+    tmp_path: typing.Any, context: typing.Any
+) -> None:
+    from cxas_scrapi.utils.lint_rules.structure import CallbackFileReferences  # noqa: PLC0415,I001
+
+    rule = CallbackFileReferences()
+    f = tmp_path / "root_agent.json"
+    f.write_text(
+        json.dumps(
+            {
+                "beforeAgentCallbacks": [{"pythonCode": "callbacks/ba.py"}],
+                "afterAgentCallbacks": [{"pythonCode": "callbacks/aa.py"}],
+                "beforeToolCallbacks": [{"pythonCode": "callbacks/bt.py"}],
+                "afterToolCallbacks": [{"pythonCode": "callbacks/at.py"}],
+            }
+        )
+    )
+
+    results = rule.check(f, f.read_text(), context)
+    assert len(results) == 4
+    messages = " ".join(r.message for r in results)
+    for expected in ("ba.py", "aa.py", "bt.py", "at.py"):
+        assert expected in messages
+
+
 def test_s003_not_json_skipped(
     tmp_path: typing.Any, context: typing.Any
 ) -> None:
@@ -2396,6 +2492,36 @@ def test_s005_agent_paths_invalid_callback(
     assert len(results) == 1
     assert "Agent callback pythonCode path" in results[0].message
     assert "agents/root_agent/" in results[0].message
+
+
+def test_s005_agent_and_tool_callbacks_invalid_path(
+    tmp_path: typing.Any, context: typing.Any
+) -> None:
+    from cxas_scrapi.utils.lint_rules.structure import StrictAgentPathLayout  # noqa: PLC0415,I001
+
+    rule = StrictAgentPathLayout()
+    f = tmp_path / "root_agent.json"
+    f.write_text(
+        json.dumps(
+            {
+                "beforeAgentCallbacks": [{"pythonCode": "callbacks/ba.py"}],
+                "afterAgentCallbacks": [{"pythonCode": "callbacks/aa.py"}],
+                "beforeToolCallbacks": [{"pythonCode": "callbacks/bt.py"}],
+                "afterToolCallbacks": [{"pythonCode": "callbacks/at.py"}],
+            }
+        )
+    )
+
+    results = rule.check(f, f.read_text(), context)
+    assert len(results) == 4
+    messages = " ".join(r.message for r in results)
+    for cb_type in (
+        "beforeAgentCallbacks[0]",
+        "afterAgentCallbacks[0]",
+        "beforeToolCallbacks[0]",
+        "afterToolCallbacks[0]",
+    ):
+        assert cb_type in messages
 
 
 def test_s006_tool_paths_valid(
