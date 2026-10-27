@@ -888,11 +888,26 @@ class SimulationEvals(Apps):
                             )
                     if audio_parts:
                         checks_result = {}
+                        resolved_registry = getattr(
+                            traces,
+                            "_resolve_audio_analyses",
+                            lambda: ANALYSIS_REGISTRY,
+                        )()
+                        if (
+                            not isinstance(resolved_registry, dict)
+                            or not resolved_registry
+                        ):
+                            resolved_registry = ANALYSIS_REGISTRY
                         for (
                             analysis_name,
                             analysis,
-                        ) in ANALYSIS_REGISTRY.items():
-                            if analysis_name == "no_long_pauses":
+                        ) in resolved_registry.items():
+                            if (
+                                analysis_name == "no_long_pauses"
+                                or not analysis.filter_files(
+                                    ["agent-turn-1.wav"]
+                                )
+                            ):
                                 checks_result[analysis_name] = {
                                     "result": "SKIP",
                                     "justification": (

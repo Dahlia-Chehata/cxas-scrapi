@@ -54,6 +54,8 @@ from cxas_scrapi.utils.tracing.app_config import AppConfig
 from cxas_scrapi.utils.tracing.audio_analysis import (
     ANALYSIS_REGISTRY,
     AudioAnalysis,
+    ScorecardAudioAnalysis,
+    load_audio_questions,
 )
 from cxas_scrapi.utils.tracing.audio_drift import (
     describe as _drift_describe,
@@ -1148,21 +1150,65 @@ class Traces(Common):
 
     # ----------------------------- analysis ---------------------------------
 
+    def _resolve_audio_analyses(
+        self,
+        questions_path: str | None = None,
+        questions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, AudioAnalysis]:
+        """Merges built-in analyses, custom files, and config metrics."""
+        registry: dict[str, AudioAnalysis] = dict(ANALYSIS_REGISTRY)
+
+        cfg_questions_file = (
+            questions_path or self.trace_config.audio.questions_file
+        )
+        if cfg_questions_file:
+            registry.update(load_audio_questions(cfg_questions_file))
+
+        if questions:
+            for q in questions:
+                analysis = ScorecardAudioAnalysis.from_question(q)
+                registry[str(analysis.name)] = analysis
+
+        for name, override in self.trace_config.gemini.audio_metrics.items():
+            override_dict = override.to_question_dict(name)
+            if name in registry:
+                existing = registry[name]
+                if isinstance(existing, ScorecardAudioAnalysis):
+                    merged_q = {**existing.to_question_dict(), **override_dict}
+                    registry[name] = ScorecardAudioAnalysis.from_question(
+                        merged_q
+                    )
+                else:
+                    merged_q = {
+                        "abbreviation": str(existing.name),
+                        "prompt": existing.prompt,
+                        **override_dict,
+                    }
+                    registry[name] = ScorecardAudioAnalysis(
+                        question=merged_q,
+                        fallback_filter=existing.filter_files,
+                    )
+            else:
+                registry[name] = ScorecardAudioAnalysis.from_question(
+                    override_dict
+                )
+
+        return registry
+
     def analyze_audio(
         self,
         conversation_id: str,
         metrics: list[str] | None = None,
         normalized: dict[str, Any] | None = None,
         audio_local_path: str | None = None,
+        questions_path: str | None = None,
+        questions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Runs configured audio analyses over the conversation recording.
 
-        Uses the analysis registry in `utils.audio_analysis` (5 built-in
-        analyses: voice consistency, no long pauses, agent having trouble,
-        agent looping, agent cutoff). Each analysis declares which audio
-        files it needs (e.g. `agent-turn-*.wav` vs `full-session.wav`).
-        Prompt overrides may be supplied via `trace.yaml` under
-        `gemini.audio_metrics.<analysis_name>.prompt`.
+        Uses the built-in scorecard questions in `utils.tracing.audio_analysis`
+        plus any custom questions from `questions_path`, `questions`, or
+        `trace.yaml` (`audio.questions_file` and `gemini.audio_metrics`).
 
         Returns `{analysis_name: {result: PASS|FAIL|SKIP|ERROR, justification,
         files_analyzed}}`.
@@ -1171,25 +1217,29 @@ class Traces(Common):
         if not files:
             return {"error": "No audio files found for this conversation."}
 
+        registry = self._resolve_audio_analyses(
+            questions_path=questions_path,
+            questions=questions,
+        )
+
         if metrics:
             selected: list[AudioAnalysis] = [
-                ANALYSIS_REGISTRY[m] for m in metrics if m in ANALYSIS_REGISTRY
+                registry[m] for m in metrics if m in registry
             ]
-            unknown = [m for m in metrics if m not in ANALYSIS_REGISTRY]
+            unknown = [m for m in metrics if m not in registry]
             if unknown:
                 logger.warning(
                     f"Skipping unknown audio analyses: {unknown}. "
-                    f"Available: {sorted(ANALYSIS_REGISTRY)}"
+                    f"Available: {sorted(registry)}"
                 )
         else:
-            selected = list(ANALYSIS_REGISTRY.values())
+            selected = list(registry.values())
 
         gem = GeminiGenerate(
             project_id=self.project_id,
             credentials=self.creds,
             model_name=self.trace_config.gemini.model,
         )
-        overrides = self.trace_config.gemini.audio_metrics
         mime_type = self.trace_config.audio.mime_type
 
         results: dict[str, Any] = {}
@@ -1204,15 +1254,11 @@ class Traces(Common):
                     "files_analyzed": [],
                 }
                 continue
-            prompt = analysis.prompt
-            override = overrides.get(str(analysis.name))
-            if override is not None:
-                prompt = override.prompt
             parts = [
                 genai.types.Part.from_uri(file_uri=f, mime_type=mime_type)
                 for f in analysis_files
             ]
-            parts.append(prompt)
+            parts.append(analysis.prompt)
             response = gem.generate_with_parts(
                 parts=parts,
                 thinking_level=self.trace_config.gemini.thinking_level,
