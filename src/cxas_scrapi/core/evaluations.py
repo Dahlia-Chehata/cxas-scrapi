@@ -15,6 +15,7 @@
 
 """Core Evaluations class for CXAS Scrapi."""
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -372,12 +373,22 @@ class Evaluations(Common):
             )
 
         run_status = self.client.get_evaluation_run(name=evaluation_run_id)
+        result_names = list(run_status.evaluation_results or [])
+        if not result_names:
+            return []
+        if len(result_names) == 1:
+            return [self.client.get_evaluation_result(name=result_names[0])]
 
-        results = []
-        for result_name in run_status.evaluation_results:
-            results.append(self.client.get_evaluation_result(name=result_name))
-
-        return results
+        max_workers = min(16, len(result_names))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            return list(
+                executor.map(
+                    lambda rname: self.client.get_evaluation_result(name=rname),
+                    result_names,
+                )
+            )
 
     def build_search_index(
         self, app_name: str | None = None, force: bool = False
@@ -670,16 +681,91 @@ class Evaluations(Common):
         )
         return self.client.create_evaluation(request=request)
 
+    @staticmethod
+    def _has_tool_expectations(eval_dict: dict[str, Any]) -> bool:
+        golden = eval_dict.get("golden") or eval_dict
+        for turn in golden.get("turns") or []:
+            for step in turn.get("steps") or []:
+                exp = step.get("expectation") or {}
+                if (
+                    "toolCall" in exp
+                    or "tool_call" in exp
+                    or "toolResponse" in exp
+                    or "tool_response" in exp
+                ):
+                    return True
+        return False
+
+    def resolve_evaluation_tool_references(
+        self,
+        evaluation: dict[str, Any],
+        app_name: str | None = None,
+        tools_reverse_map: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Resolves tool display names to tool resource names in-place."""
+        if not isinstance(evaluation, dict) or not self._has_tool_expectations(
+            evaluation
+        ):
+            return evaluation
+
+        app_name = app_name or self.app_name
+        if tools_reverse_map is None:
+            try:
+                tools_reverse_map = Tools(
+                    app_name=app_name, creds=self.creds
+                ).get_tools_map(reverse=True)
+            except Exception:  # noqa: BLE001
+                tools_reverse_map = {}
+
+        if not tools_reverse_map:
+            return evaluation
+
+        valid_resources = set(tools_reverse_map.values())
+        golden = evaluation.get("golden") or evaluation
+        for turn in golden.get("turns") or []:
+            for step in turn.get("steps") or []:
+                exp = step.get("expectation") or {}
+                for key in (
+                    "toolCall",
+                    "tool_call",
+                    "toolResponse",
+                    "tool_response",
+                ):
+                    tc = exp.get(key)
+                    if not isinstance(tc, dict):
+                        continue
+                    tool_ref = tc.get("tool", "")
+                    if tool_ref in valid_resources:
+                        continue
+                    dname = (
+                        tc.get("displayName")
+                        or tc.get("display_name")
+                        or (
+                            tool_ref.split("/")[-1]
+                            if "/" in str(tool_ref)
+                            else str(tool_ref)
+                        )
+                    )
+                    if dname and dname in tools_reverse_map:
+                        tc["tool"] = tools_reverse_map[dname]
+        return evaluation
+
     def update_evaluation(
         self,
         evaluation: types.Evaluation | dict[str, Any],
         app_name: str | None = None,
+        replace: bool = False,
     ) -> types.Evaluation:
         """Updates an evaluation. If it doesn't exist, it creates it.
+
+        Automatically falls back to delete + create when the platform returns
+        501 Not Implemented on UpdateEvaluation (or when ``replace=True``).
 
         Args:
             evaluation: The Evaluation object or dict to update.
             app_name: Parent App ID. Defaults to self.app_name.
+            replace: If True, deletes any existing evaluation with the same
+                display_name and recreates it via CreateEvaluation.
         """
         app_name = app_name or self.app_name
         if not app_name:
@@ -687,6 +773,10 @@ class Evaluations(Common):
 
         # Convert dict to types.Evaluation if needed
         if isinstance(evaluation, dict):
+            if self._has_tool_expectations(evaluation):
+                self.resolve_evaluation_tool_references(
+                    evaluation, app_name=app_name
+                )
             # Use json_format to parse dict to message to handle
             # camelCase/snake_case
             eval_message = types.Evaluation()
@@ -714,9 +804,128 @@ class Evaluations(Common):
                 evaluation=evaluation, app_name=app_name
             )
 
+        if replace:
+            existing_name = evaluation.name
+            self.delete_evaluation(name=existing_name, force=True)
+            evaluation.name = ""
+            return self.create_evaluation(
+                evaluation=evaluation, app_name=app_name
+            )
+
         print(f"Updating existing evaluation: {evaluation.name}")
         request = types.UpdateEvaluationRequest(evaluation=evaluation)
-        return self.client.update_evaluation(request=request)
+        try:
+            return self.client.update_evaluation(request=request)
+        except Exception as exc:
+            err_text = str(exc).upper()
+            if (
+                "501" in err_text
+                or "UNIMPLEMENTED" in err_text
+                or "NOT IMPLEMENTED" in err_text
+            ):
+                existing_name = evaluation.name
+                self.delete_evaluation(name=existing_name, force=True)
+                evaluation.name = ""
+                return self.create_evaluation(
+                    evaluation=evaluation, app_name=app_name
+                )
+            raise
+
+    def sync_evaluations(
+        self,
+        evaluations: list[types.Evaluation | dict[str, Any]],
+        app_name: str | None = None,
+        prune: bool = False,
+        prune_tag: str | None = None,
+        resolve_tools: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, list[str]]:
+        """Synchronizes evaluations by display_name via delete+create.
+
+        Resolves tool display names to server-minted tool resource IDs and
+        optionally prunes stale remote evaluations whose display_name is not
+        present in ``evaluations``.
+        """
+        app_name = app_name or self.app_name
+        if not app_name:
+            raise ValueError("app_name is required.")
+
+        tools_reverse_map: dict[str, str] | None = None
+        if resolve_tools and any(
+            isinstance(ev, dict) and self._has_tool_expectations(ev)
+            for ev in evaluations
+        ):
+            try:
+                tools_reverse_map = Tools(
+                    app_name=app_name, creds=self.creds
+                ).get_tools_map(reverse=True)
+            except Exception:  # noqa: BLE001
+                tools_reverse_map = {}
+
+        existing_list = list(self.list_evaluations(app_name) or [])
+        existing_by_display: dict[str, list[str]] = {}
+        for item in existing_list:
+            if getattr(item, "display_name", None) and getattr(
+                item, "name", None
+            ):
+                existing_by_display.setdefault(item.display_name, []).append(
+                    item.name
+                )
+
+        pushed: list[str] = []
+        suite_names: set[str] = set()
+
+        for item in evaluations:
+            if isinstance(item, dict):
+                payload = dict(item)
+                if resolve_tools:
+                    self.resolve_evaluation_tool_references(
+                        payload,
+                        app_name=app_name,
+                        tools_reverse_map=tools_reverse_map,
+                    )
+                dname = (
+                    payload.get("displayName")
+                    or payload.get("display_name")
+                    or ""
+                )
+                payload.pop("name", None)
+            else:
+                payload = item
+                dname = getattr(item, "display_name", "") or ""
+
+            if dname:
+                suite_names.add(dname)
+
+            if dry_run:
+                pushed.append(dname)
+                continue
+
+            for old_name in existing_by_display.get(dname, []):
+                self.delete_evaluation(name=old_name, force=True)
+
+            if not isinstance(payload, dict) and getattr(payload, "name", None):
+                payload.name = ""
+
+            created = self.create_evaluation(
+                evaluation=payload, app_name=app_name
+            )
+            pushed.append(getattr(created, "display_name", "") or dname)
+
+        pruned: list[str] = []
+        if prune and not dry_run:
+            for item in existing_list:
+                dname = getattr(item, "display_name", "") or ""
+                if dname in suite_names:
+                    continue
+                if prune_tag:
+                    item_tags = list(getattr(item, "tags", []) or [])
+                    if prune_tag not in item_tags:
+                        continue
+                self.delete_evaluation(name=item.name, force=True)
+                pruned.append(dname or item.name)
+
+        return {"pushed": pushed, "pruned": pruned}
 
     def delete_evaluation(self, name: str, force: bool = False) -> None:
         """Deletes an evaluation.

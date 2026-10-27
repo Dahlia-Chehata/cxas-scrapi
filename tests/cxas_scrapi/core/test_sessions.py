@@ -1329,3 +1329,26 @@ def test_run_session_audio_plumbs_skip_playback_wait(
 
     mock_handler_cls.assert_called_once()
     assert mock_handler_cls.call_args.kwargs["skip_playback_wait"] is True
+
+
+@patch("cxas_scrapi.core.sessions.Sessions._check_audio_requirements")
+@patch("cxas_scrapi.core.sessions.SessionServiceClient")
+def test_bidi_run_session_raises_on_tts_failure(
+    mock_client_cls: typing.Any,
+    mock_check_reqs: typing.Any,
+) -> None:
+    sessions = Sessions(app_name="projects/p/locations/l/apps/a")
+    with patch(
+        "cxas_scrapi.core.sessions.AudioTransformer"
+    ) as mock_transformer_cls:
+        mock_transformer = mock_transformer_cls.return_value
+        mock_transformer.text_to_speech_bytes.return_value = {
+            "audio_bytes": None,
+            "text": "hello",
+        }
+        with pytest.raises(RuntimeError, match="TTS produced no audio"):
+            sessions.run(
+                session_id="s1",
+                text="hello",
+                modality=Modality.AUDIO,
+            )

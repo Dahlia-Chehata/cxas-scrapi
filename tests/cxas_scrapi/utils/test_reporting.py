@@ -3438,3 +3438,107 @@ def test_audio_analysis_opt_in_gating_and_flags(tmp_path: typing.Any) -> None:
 
     sig = inspect.signature(evals_runner.run_all_evals)
     assert sig.parameters["audio_analysis"].default is False
+
+
+def test_summarize_and_gate_evals_k_of_n_and_fail_closed() -> None:
+    from cxas_scrapi.utils.reporting import (  # noqa: PLC0415
+        summarize_and_gate_evals,
+    )
+
+    sim_results = [
+        {"name": "case_a", "passed": True},
+        {"name": "case_a", "passed": False},
+        {"name": "case_a", "passed": True},
+        {
+            "name": "case_b",
+            "passed": False,
+            "expectations": [
+                {"expectation": "Must greet caller", "status": "Not Met"}
+            ],
+        },
+        {"name": "case_b", "passed": False},
+        {"name": "case_b", "passed": True},
+    ]
+
+    summary = summarize_and_gate_evals(
+        sim_results=sim_results,
+        min_run_passes=2,
+        min_pass_rate=0.8,
+    )
+    assert summary["passed_cases"] == 1
+    assert summary["total_cases"] == 2
+    assert summary["pass_rate"] == 0.5
+    assert summary["gate_passed"] is False
+
+    empty_summary = summarize_and_gate_evals(
+        sim_results=[],
+        min_run_passes=1,
+        min_pass_rate=0.5,
+    )
+    assert empty_summary["total_cases"] == 0
+    assert empty_summary["gate_passed"] is False
+    assert "failing closed" in empty_summary["gate_reason"]
+
+
+@patch("cxas_scrapi.utils.reporting.gcs_utils.GCSUtils")
+def test_write_eval_stamp_and_github_step_summary_and_publish_bundle(
+    mock_gcs_cls: typing.Any,
+    tmp_path: typing.Any,
+) -> None:
+    from cxas_scrapi.utils.reporting import (  # noqa: PLC0415
+        publish_eval_report_bundle,
+        summarize_and_gate_evals,
+        write_eval_stamp,
+        write_github_step_summary,
+    )
+
+    mock_uploader = mock_gcs_cls.return_value
+    mock_uploader.upload_file.side_effect = lambda uri, _local, **_kw: (
+        f"https://storage.mtls.cloud.google.com/{uri.removeprefix('gs://')}"
+    )
+
+    report_file = tmp_path / "combined_report.html"
+    report_file.write_text("<html>report</html>")
+    (tmp_path / "sim_results.json").write_text("[]")
+
+    gate = summarize_and_gate_evals(
+        sim_results=[{"name": "case_1", "passed": True}],
+        min_run_passes=1,
+        min_pass_rate=1.0,
+    )
+    stamp_path = write_eval_stamp(
+        output_dir=str(tmp_path),
+        suite_name="sims-text",
+        gate_summary=gate,
+        modality="text",
+        runs=1,
+    )
+    assert os.path.isfile(stamp_path)
+
+    published = publish_eval_report_bundle(
+        output_dir=str(tmp_path),
+        report_path=str(report_file),
+        gcs_bundle_uri="gs://my-bucket/evals/main/run-1",
+        suite_name="sims-text",
+    )
+    assert "report_url" in published
+    assert "latest_url" in published
+    latest_calls = [
+        c
+        for c in mock_uploader.upload_file.call_args_list
+        if "latest-sims-text.html" in c.args[0]
+    ]
+    assert len(latest_calls) == 1
+    assert latest_calls[0].kwargs["cache_control"] == "no-cache, max-age=0"
+
+    summary_md = tmp_path / "step_summary.md"
+    write_github_step_summary(
+        gate_summary=gate,
+        suite_name="sims-text",
+        published_urls=published,
+        summary_path=str(summary_md),
+    )
+    md_text = summary_md.read_text()
+    assert "### sims-text" in md_text
+    assert "**1 / 1 cases passed**" in md_text
+    assert "Open HTML Report" in md_text

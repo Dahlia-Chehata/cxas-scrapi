@@ -321,3 +321,38 @@ class TestAudioTransformer:
         # Verify graceful fallback to clean audio
         assert result["text"] == "hello"
         assert result["audio_bytes"] == b"clean_audio_"
+
+    @patch("google.auth.transport.requests.Request")
+    @patch("cxas_scrapi.core.audio_transformer.texttospeech")
+    def test_text_to_speech_bytes_refreshes_expired_credentials_and_retries(
+        self, mock_tts: typing.Any, mock_auth_request: typing.Any
+    ) -> None:
+        mock_client_1 = MagicMock()
+        mock_client_2 = MagicMock()
+        mock_tts.TextToSpeechClient.side_effect = [mock_client_1, mock_client_2]
+
+        with io.BytesIO() as wav_io:
+            with wave.open(wav_io, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(b"recovered_audio_")
+            wav_bytes = wav_io.getvalue()
+
+        mock_response = MagicMock()
+        mock_response.audio_content = wav_bytes
+        mock_client_1.synthesize_speech.side_effect = RuntimeError(
+            "401 Token expired"
+        )
+        mock_client_2.synthesize_speech.return_value = mock_response
+
+        creds = MagicMock()
+        result = self.transformer.text_to_speech_bytes(
+            text="retry turn",
+            credentials=creds,
+            project_id="test-project",
+        )
+
+        assert result["audio_bytes"] == b"recovered_audio_"
+        creds.refresh.assert_called_once_with(mock_auth_request.return_value)
+        assert mock_tts.TextToSpeechClient.call_count == 2

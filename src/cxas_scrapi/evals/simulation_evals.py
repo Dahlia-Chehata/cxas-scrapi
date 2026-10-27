@@ -1696,8 +1696,110 @@ class SimulationEvals(Apps):
         return 0
 
     @staticmethod
+    def _transcript_lines(row: dict[str, Any]) -> list[str]:
+        return [
+            line
+            for line in (row.get("transcript") or "").split("\n")
+            if line.startswith(("User:", "Agent:", "Agent Action:"))
+            and line.strip() != "User:"
+        ]
+
+    @staticmethod
+    def _ends_unanswered(row: dict[str, Any]) -> bool:
+        lines = SimulationEvals._transcript_lines(row)
+        return (
+            bool(lines)
+            and lines[-1].startswith("User:")
+            and not lines[-1].startswith("User: event")
+        )
+
+    @staticmethod
+    def _agent_ended_call(turn: dict[str, Any]) -> bool:
+        for message in turn.get("messages") or []:
+            for chunk in message.get("chunks") or []:
+                payload = chunk.get("payload")
+                if isinstance(payload, dict):
+                    if any(
+                        str(k).startswith(("transferTo", "transfer_to"))
+                        for k in payload
+                    ):
+                        return True
+                    if payload.get("action") == "end":
+                        return True
+                    if any(
+                        isinstance(v, dict) and v.get("action") == "end"
+                        for v in payload.values()
+                    ):
+                        return True
+                tc = chunk.get("toolCall") or chunk.get("tool_call") or {}
+                if isinstance(tc, dict):
+                    dname = (
+                        tc.get("displayName") or tc.get("display_name") or ""
+                    )
+                    tool_ref = str(tc.get("tool") or "")
+                    if dname == "end_session" or tool_ref.endswith(
+                        "/end_session"
+                    ):
+                        return True
+        return False
+
+    @staticmethod
+    def _lost_turn(
+        row: dict[str, Any], conv: dict[str, Any] | None
+    ) -> str | None:
+        if not conv or not conv.get("turns"):
+            return None
+        if SimulationEvals._agent_ended_call(conv["turns"][-1]):
+            return None
+        lines = SimulationEvals._transcript_lines(row)
+        sent = [line for line in lines if line.startswith("User:")]
+        spoken = [line for line in sent if not line.startswith("User: event")]
+        input_types = conv.get("inputTypes") or conv.get("input_types") or []
+        if spoken and "INPUT_TYPE_AUDIO" not in input_types:
+            return "caller audio never reached CES"
+        turn_count = int(conv.get("turnCount") or conv.get("turn_count") or 0)
+        if turn_count < len(sent):
+            return "caller's last turn never reached CES"
+        return None
+
+    def _ces_conversation_lookup(
+        self,
+    ) -> Callable[[dict[str, Any]], dict[str, Any] | None]:
+        cache: dict[str, dict[str, Any] | None] = {}
+        history_holder: list[Any] = []
+
+        def lookup(row: dict[str, Any]) -> dict[str, Any] | None:
+            sid = row.get("session_id")
+            if not sid:
+                return None
+            if sid not in cache:
+                try:
+                    if not history_holder:
+                        history_holder.append(
+                            ConversationHistory(
+                                app_name=self.app_name,
+                                creds=self.creds,
+                                transport="rest",
+                            )
+                        )
+                    conv_obj = history_holder[0].get_conversation(sid)
+                    if isinstance(conv_obj, dict):
+                        cache[sid] = conv_obj
+                    elif hasattr(type(conv_obj), "to_dict"):
+                        cache[sid] = type(conv_obj).to_dict(conv_obj)
+                    else:
+                        cache[sid] = None
+                except Exception:  # noqa: BLE001
+                    cache[sid] = None
+            return cache[sid]
+
+        return lookup
+
+    @staticmethod
     def _inconclusive_reason(
-        row: dict[str, Any], declared_by_name: dict[str, int]
+        row: dict[str, Any],
+        declared_by_name: dict[str, int],
+        lookup: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     ) -> str | None:
         if row.get("error"):
             return f"session died: {str(row['error'])[:80]}"
@@ -1706,6 +1808,8 @@ class SimulationEvals(Apps):
             row.get("expectations", "")
         ).endswith("/0"):
             return "judge returned no verdicts"
+        if lookup is not None and SimulationEvals._ends_unanswered(row):
+            return SimulationEvals._lost_turn(row, lookup(row))
         return None
 
     def _aggregate_simulation_results(
@@ -1864,12 +1968,22 @@ class SimulationEvals(Apps):
             if isinstance(tc, dict) and tc.get("name")
         }
 
+        conv_lookup = (
+            self._ces_conversation_lookup()
+            if modality.lower() == "audio"
+            else None
+        )
+
         for attempt in range(1, max(0, infra_retries) + 1):
             bad = [
                 (idx, why)
                 for idx, row in enumerate(results)
                 if isinstance(row, dict)
-                and (why := self._inconclusive_reason(row, declared_by_name))
+                and (
+                    why := self._inconclusive_reason(
+                        row, declared_by_name, lookup=conv_lookup
+                    )
+                )
             ]
             if not bad:
                 break
@@ -1938,7 +2052,11 @@ class SimulationEvals(Apps):
             (row, why)
             for row in results
             if isinstance(row, dict)
-            and (why := self._inconclusive_reason(row, declared_by_name))
+            and (
+                why := self._inconclusive_reason(
+                    row, declared_by_name, lookup=conv_lookup
+                )
+            )
         ]
         for row, _ in still:
             if row.get("passed"):

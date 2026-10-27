@@ -22,6 +22,7 @@ import time
 import typing
 from collections.abc import Callable
 
+import yaml
 from google.cloud.ces_v1beta.types import RunEvaluationOperationMetadata
 
 from cxas_scrapi.core.evaluations import Evaluations
@@ -81,6 +82,7 @@ def run_all_evals(
     infra_retries: int = 0,
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
+    golden_run_method: str = "STABLE",
 ) -> typing.Any:
     """Runs all evaluations and returns aggregated results.
 
@@ -147,7 +149,26 @@ def run_all_evals(
                     res = eval_client.update_evaluation(
                         evaluation=eval_dict, app_name=app_name
                     )
-                    evaluations_to_run.append(res.name)
+                    if res.name not in evaluations_to_run:
+                        evaluations_to_run.append(res.name)
+        elif app_name and (filter_tags or filter_names):
+            eval_client = Evaluations(app_name=app_name)
+            for eval_obj in eval_client.list_evaluations(app_name=app_name):
+                tag_ok = not filter_tags or any(
+                    t in (getattr(eval_obj, "tags", None) or [])
+                    for t in filter_tags
+                )
+                name_ok = not filter_names or (
+                    getattr(eval_obj, "display_name", None) in filter_names
+                    or getattr(eval_obj, "name", None) in filter_names
+                )
+                if (
+                    tag_ok
+                    and name_ok
+                    and getattr(eval_obj, "name", None)
+                    and eval_obj.name not in evaluations_to_run
+                ):
+                    evaluations_to_run.append(eval_obj.name)
 
     # 2. Callback tests
     if "callbacks" in include:
@@ -329,6 +350,17 @@ def run_all_evals(
                         )
                         with open(save_path, "w") as f:
                             json.dump(sim_results, f, indent=2)
+                        cases_path = os.path.join(
+                            output_dir,
+                            add_timestamp_suffix("sim_cases.yaml", timestamp),
+                        )
+                        with open(cases_path, "w", encoding="utf-8") as f:
+                            yaml.safe_dump(
+                                {"evals": test_cases},
+                                f,
+                                sort_keys=False,
+                                allow_unicode=True,
+                            )
 
     # 4b. Shadow evaluations
     if "shadows" in include:
@@ -440,12 +472,15 @@ def run_all_evals(
                 f"\n  [Batch {idx + 1}/{len(batches)}] "
                 f"Triggering evaluations: {batch}"
             )
-            operation = eval_client.run_evaluation(
-                evaluations=batch,
-                app_name=app_name,
-                modality=modality,
-                run_count=runs,
-            )
+            run_eval_kwargs: dict[str, typing.Any] = {
+                "evaluations": batch,
+                "app_name": app_name,
+                "modality": modality,
+                "run_count": runs,
+            }
+            if golden_run_method != "STABLE":
+                run_eval_kwargs["golden_run_method"] = golden_run_method
+            operation = eval_client.run_evaluation(**run_eval_kwargs)
 
             # Resolve run name
             batch_run_name = None
@@ -479,5 +514,12 @@ def run_all_evals(
                     f"    ERROR: Failed to resolve run name for batch "
                     f"{idx + 1}. Skipping."
                 )
+        if output_dir and results["golden"]:
+            ces_save_path = os.path.join(
+                output_dir,
+                add_timestamp_suffix("ces_results.json", timestamp),
+            )
+            with open(ces_save_path, "w", encoding="utf-8") as f:
+                json.dump(results["golden"], f, indent=2, default=str)
 
     return results

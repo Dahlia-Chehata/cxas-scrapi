@@ -1735,6 +1735,8 @@ class BidiInteractiveSession:
                 background_noise_file=self.background_noise_file,
                 voice_config=current_voice_config,
             )
+            if not input_data.get("audio_bytes"):
+                raise RuntimeError(f"TTS produced no audio for {text!r}")
 
             audio_payload = {
                 "audio": input_data["audio_bytes"],
@@ -2526,6 +2528,11 @@ class Sessions(Common):
                         )
                     )
                 for input_data in input_audio_bytes:
+                    if not input_data.get("audio_bytes"):
+                        raise RuntimeError(
+                            "TTS produced no audio for "
+                            f"{input_data.get('text')!r}"
+                        )
                     # Construct input payload matching sessions.py expectation
                     audio_payload = {
                         "audio": input_data["audio_bytes"],

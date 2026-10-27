@@ -92,9 +92,38 @@ class AudioTransformer:
             sample_rate_hertz=16000,
         )
         try:
-            response = client.synthesize_speech(
-                input=synthesis_input, voice=voice, audio_config=audio_config
-            )
+            try:
+                response = client.synthesize_speech(
+                    input=synthesis_input,
+                    voice=voice,
+                    audio_config=audio_config,
+                )
+            except Exception:
+                with AudioTransformer._lock:
+                    if credentials is not None and hasattr(
+                        credentials, "refresh"
+                    ):
+                        try:
+                            from google.auth.transport.requests import (  # noqa: PLC0415
+                                Request as AuthRequest,
+                            )
+
+                            credentials.refresh(AuthRequest())
+                        except Exception as refresh_err:
+                            logging.debug(
+                                "Failed to refresh TTS credentials: "
+                                f"{refresh_err}"
+                            )
+                    client_opts = ClientOptions(quota_project_id=project_id)
+                    AudioTransformer._client = texttospeech.TextToSpeechClient(
+                        credentials=credentials, client_options=client_opts
+                    )
+                    client = AudioTransformer._client
+                response = client.synthesize_speech(
+                    input=synthesis_input,
+                    voice=voice,
+                    audio_config=audio_config,
+                )
 
             if burst_noise_files and AudioSegment is None:
                 logging.warning(

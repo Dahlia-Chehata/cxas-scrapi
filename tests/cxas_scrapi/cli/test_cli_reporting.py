@@ -497,3 +497,49 @@ def test_combined_evals_report_cmd_audio_analysis_passthrough(
 
         mock_report.assert_called_once()
         assert mock_report.call_args[1].get("audio_analysis") is flag_value
+
+
+def test_combined_evals_report_cmd_exits_nonzero_when_gate_fails(
+    tmp_path: typing.Any,
+) -> None:
+    evals_dir = tmp_path / "evals"
+    evals_dir.mkdir()
+
+    class Args(argparse.Namespace):
+        def __init__(self) -> None:
+            self.output_dir = str(evals_dir)
+            self.output = None
+            self.gcs_path = None
+            self.golden_run = None
+            self.app_name = None
+            self.run = False
+            self.app_dir = None
+            self.tool_test_file = None
+            self.goldens_dir = None
+            self.simulation_dir = None
+            self.include = "sims"
+            self.input_dir = None
+            self.modality = "text"
+            self.runs = 3
+            self.use_tool_fakes = False
+            self.sim_user_model = None
+            self.eval_model = None
+            self.min_run_passes = 2
+            self.min_pass_rate = 0.8
+
+    args = Args()
+
+    with patch(
+        "cxas_scrapi.utils.reporting.generate_combined_report_from_dir",
+        return_value=(
+            str(evals_dir / "combined_report.html"),
+            {"gate_passed": False, "pass_rate": 0.5},
+        ),
+    ) as mock_report:
+        with pytest.raises(SystemExit) as excinfo:
+            combined_evals_report_cmd(args)
+        assert excinfo.value.code == 1
+        mock_report.assert_called_once()
+        assert mock_report.call_args[1]["min_run_passes"] == 2
+        assert mock_report.call_args[1]["min_pass_rate"] == 0.8
+        assert mock_report.call_args[1]["return_gate_status"] is True
