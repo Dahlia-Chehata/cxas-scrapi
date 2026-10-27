@@ -2967,3 +2967,86 @@ def test_reconcile_completed_steps_skips_when_harness_error_present() -> None:
 
     assert prog_ready.status == StepStatus.IN_PROGRESS
     assert "(Reconciled" not in prog_ready.justification
+
+
+def test_inconclusive_reason_detects_lost_audio_turn() -> None:
+    row = {
+        "name": "case_lost_turn",
+        "session_id": "sess-lost-turn-1",
+        "transcript": (
+            "User: event\n"
+            "Agent: Welcome! How can I help you today?\n"
+            "User: I need to check my appointment window.\n"
+            "Agent: Could you confirm your phone number?\n"
+            "User: It is 555-0199."
+        ),
+    }
+
+    def fake_lookup(r: dict[str, typing.Any]) -> dict[str, typing.Any]:
+        assert r["session_id"] == "sess-lost-turn-1"
+        return {
+            "turnCount": 2,
+            "inputTypes": ["INPUT_TYPE_EVENT", "INPUT_TYPE_AUDIO"],
+            "turns": [{"messages": []}, {"messages": []}],
+        }
+
+    reason = SimulationEvals._inconclusive_reason(
+        row=row,
+        declared_by_name={"case_lost_turn": 1},
+        lookup=fake_lookup,
+    )
+    assert reason == "caller's last turn never reached CES"
+
+
+def test_inconclusive_reason_ignores_answered_or_agent_ended_turn() -> None:
+    row = {
+        "name": "case_answered",
+        "session_id": "sess-answered-1",
+        "transcript": (
+            "User: Thanks for the update.\nAgent: You are all set. Goodbye!"
+        ),
+    }
+
+    reason = SimulationEvals._inconclusive_reason(
+        row=row,
+        declared_by_name={"case_answered": 1},
+        lookup=lambda _r: {
+            "turnCount": 1,
+            "inputTypes": ["INPUT_TYPE_AUDIO"],
+            "turns": [{"messages": []}],
+        },
+    )
+    assert reason is None
+
+
+def test_simulation_evals_infra_retries_default_and_half_parallel() -> None:
+    """By default, run_simulations retries up to 2 times at max(1, parallel // 2) concurrency."""
+    evals = _naturalness_evals(expectations_only=True)
+    test_cases = [{"name": f"c{i}"} for i in range(4)]
+    err_rows = [
+        {"name": f"c{i}", "run": 1, "passed": False, "error": "transient error"}
+        for i in range(4)
+    ]
+    ok_rows = [
+        {"name": f"c{i}", "run": 1, "passed": True, "expectations": "0/0"}
+        for i in range(4)
+    ]
+
+    with patch.object(
+        evals,
+        "_aggregate_simulation_results",
+        side_effect=[err_rows, err_rows, ok_rows],
+    ) as mock_agg:
+        results = evals.run_simulations(
+            test_cases=test_cases,
+            runs=1,
+            parallel=6,
+            retry_cooldown=0,
+        )
+
+    assert mock_agg.call_count == 3
+    # Initial wave uses parallel=6; retry waves default to max(1, 6 // 2) == 3
+    assert mock_agg.call_args_list[0].args[2] == 6
+    assert mock_agg.call_args_list[1].args[2] == 3
+    assert mock_agg.call_args_list[2].args[2] == 3
+    assert all(r["passed"] is True and r["infra_retries"] == 2 for r in results)

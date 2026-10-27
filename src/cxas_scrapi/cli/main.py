@@ -211,17 +211,46 @@ def push_eval(args: argparse.Namespace) -> None:
     eval_utils = EvalUtils(app_name=args.app_name)
 
     try:
-        evals = eval_utils.load_golden_evals_from_yaml(args.file)
+        target = args.file
+        evals = []
+        if os.path.isdir(target):
+            for root, _, files in os.walk(target):
+                for fname in sorted(files):
+                    if fname.endswith((".yaml", ".yml")):
+                        fpath = os.path.join(root, fname)
+                        evals.extend(
+                            eval_utils.load_golden_evals_from_yaml(fpath)
+                        )
+        else:
+            evals = eval_utils.load_golden_evals_from_yaml(target)
+
         if not evals:
             print(f"No valid evaluations found in '{args.file}'.")
             sys.exit(1)
 
+        prune = getattr(args, "prune", False)
+        prune_tag = getattr(args, "prune_tag", None)
+        dry_run = getattr(args, "dry_run", False)
+
         print(f"Parsed {len(evals)} evaluation(s). Syncing...")
-        for eval_dict in evals:
-            res = eval_client.update_evaluation(
-                evaluation=eval_dict, app_name=args.app_name
+        if prune or prune_tag or dry_run:
+            summary = eval_client.sync_evaluations(
+                evaluations=evals,
+                app_name=args.app_name,
+                prune=prune or bool(prune_tag),
+                prune_tag=prune_tag,
+                dry_run=dry_run,
             )
-            print(f"Pushed: '{res.display_name}' ({res.name})")
+            for dname in summary.get("pushed", []):
+                print(f"Synced: '{dname}'")
+            for dname in summary.get("pruned", []):
+                print(f"Pruned: '{dname}'")
+        else:
+            for eval_dict in evals:
+                res = eval_client.update_evaluation(
+                    evaluation=eval_dict, app_name=args.app_name
+                )
+                print(f"Pushed: '{res.display_name}' ({res.name})")
 
         print("\nPush complete.")
 
@@ -440,6 +469,7 @@ def run_eval(args: argparse.Namespace) -> None:
             if match:
                 evaluations_to_run.append(eval_obj.name)
 
+        evaluations_to_run = list(dict.fromkeys(evaluations_to_run))
         if not evaluations_to_run:
             print(
                 "No matching tests found for the "
@@ -449,58 +479,63 @@ def run_eval(args: argparse.Namespace) -> None:
 
         print(f"Found {len(evaluations_to_run)} matching test(s) to run.")
 
-    # Determine which evaluations to run
-    evaluations_to_run = []
-    if args.evaluation_id:
-        evaluations_to_run.append(args.evaluation_id)
-    else:
-        # Require prefix or tags if no specific ID is given
-        if not args.display_name_prefix and not args.tags:
-            print(
-                "Error: You must provide either --evaluation-id, "
-                "--display-name-prefix, or --tags to "
-                "specify which tests to run."
-            )
-            sys.exit(1)
-
-        if args.display_name_prefix:
-            print(
-                "Fetching tests matching prefix: "
-                f"'{args.display_name_prefix}'..."
-            )
-        elif args.tags:
-            print(f"Fetching tests matching tags: {args.tags}...")
-        all_evals = eval_client.list_evaluations(app_name=args.app_name)
-
-        for eval_obj in all_evals:
-            match = False
-
-            if args.display_name_prefix and eval_obj.display_name.startswith(
-                args.display_name_prefix
-            ):
-                match = True
-
-            # Assuming tags are accessible as a
-            # list/repeated field on the Evaluation
-            # object
-            if args.tags and hasattr(eval_obj, "tags"):  # noqa: SIM102
-                # intersection of CLI tags and agent tags
-                if any(t in eval_obj.tags for t in args.tags):
-                    match = True
-
-            if match:
-                evaluations_to_run.append(eval_obj.name)
-
-        if not evaluations_to_run:
-            print(
-                "No matching tests found for the "
-                "given prefix or tags. Aborting run."
-            )
-            sys.exit(0)
-
-        print(f"Found {len(evaluations_to_run)} matching test(s) to run.")
+    runs = getattr(args, "runs", 1) or 1
+    min_run_passes = getattr(args, "min_run_passes", None)
+    min_pass_rate = getattr(args, "min_pass_rate", None)
 
     try:
+        if runs > 1 or min_run_passes is not None or min_pass_rate is not None:
+            from cxas_scrapi.utils.reporting import (
+                load_golden_results,
+                summarize_and_gate_evals,
+            )
+
+            run_ids: list[str] = []
+            for run_idx in range(runs):
+                op = eval_client.run_evaluation(
+                    evaluations=evaluations_to_run,
+                    app_name=args.app_name,
+                    modality=args.modality,
+                    golden_run_method=args.golden_run_method,
+                )
+                print(
+                    f"Evaluation run {run_idx + 1}/{runs} triggered successfully."
+                )
+                if args.wait and op is not None:
+                    res = op.result(timeout=600)
+                    run_name = getattr(res, "evaluation_run", "") or getattr(
+                        getattr(op, "metadata", None), "evaluation_run", ""
+                    )
+                    if run_name:
+                        run_ids.append(run_name)
+
+            if args.wait and run_ids:
+                golden_results = load_golden_results(
+                    run_ids,
+                    args.app_name,
+                    min_run_passes=min_run_passes or 1,
+                )
+                gate_summary = summarize_and_gate_evals(
+                    golden_results=golden_results,
+                    min_run_passes=min_run_passes or 1,
+                    min_pass_rate=min_pass_rate,
+                )
+                all_passed = (
+                    gate_summary["gate_passed"]
+                    if min_pass_rate is not None
+                    else (
+                        gate_summary["passed_cases"]
+                        == gate_summary["total_cases"]
+                        and gate_summary["total_cases"] > 0
+                    )
+                )
+                if all_passed:
+                    print("\nFINAL RESULT: PASS")
+                    sys.exit(0)
+                print("\nFINAL RESULT: FAIL")
+                sys.exit(1)
+            return
+
         # Step 1: Capture existing evaluation runs to diff against later
         df_initial = eval_utils.evals_to_dataframe().get(
             "summary", pd.DataFrame()
@@ -641,8 +676,37 @@ def combined_evals_report_cmd(args: argparse.Namespace) -> None:
     extra_report_kwargs = {}
     if getattr(args, "audio_analysis", None) is not None:
         extra_report_kwargs["audio_analysis"] = args.audio_analysis
+    if getattr(args, "infra_retries", 2) != 2:
+        extra_report_kwargs["infra_retries"] = args.infra_retries
+    if getattr(args, "retry_parallel", None) is not None:
+        extra_report_kwargs["retry_parallel"] = args.retry_parallel
+    if getattr(args, "retry_cooldown", 60.0) != 60.0:
+        extra_report_kwargs["retry_cooldown"] = args.retry_cooldown
+    if getattr(args, "golden_run_method", "STABLE") != "STABLE":
+        extra_report_kwargs["golden_run_method"] = args.golden_run_method
+    if getattr(args, "min_run_passes", None) is not None:
+        extra_report_kwargs["min_run_passes"] = args.min_run_passes
+    if getattr(args, "min_pass_rate", None) is not None:
+        extra_report_kwargs["min_pass_rate"] = args.min_pass_rate
+    if getattr(args, "gcs_bundle_uri", None):
+        extra_report_kwargs["gcs_bundle_uri"] = args.gcs_bundle_uri
+    if getattr(args, "suite_name", None):
+        extra_report_kwargs["suite_name"] = args.suite_name
+    if getattr(args, "github_step_summary", False):
+        extra_report_kwargs["github_step_summary"] = True
+    if any(
+        k in extra_report_kwargs
+        for k in (
+            "min_run_passes",
+            "min_pass_rate",
+            "gcs_bundle_uri",
+            "suite_name",
+            "github_step_summary",
+        )
+    ):
+        extra_report_kwargs["return_gate_status"] = True
 
-    actual_output_path = generate_combined_report_from_dir(
+    report_res = generate_combined_report_from_dir(
         output_dir=output_dir,
         golden_run=args.golden_run,
         app_name=args.app_name,
@@ -679,7 +743,18 @@ def combined_evals_report_cmd(args: argparse.Namespace) -> None:
         naturalness=getattr(args, "naturalness", None),
         **extra_report_kwargs,
     )
+    gate_summary = None
+    if isinstance(report_res, tuple):
+        actual_output_path, gate_summary = report_res
+    else:
+        actual_output_path = report_res
     print(f"Combined report generated at {actual_output_path}")
+    if (
+        gate_summary is not None
+        and getattr(args, "min_pass_rate", None) is not None
+        and not gate_summary.get("gate_passed", True)
+    ):
+        sys.exit(1)
 
 
 def test_tools(args: argparse.Namespace) -> None:
@@ -1934,6 +2009,64 @@ def get_parser() -> argparse.ArgumentParser:
         default="global",
         help="Vertex AI location for evaluation LLM models. Defaults to 'global'.",
     )
+    parser_report.add_argument(
+        "--min-run-passes",
+        type=int,
+        default=None,
+        help="Minimum passing runs per case for k-of-N majority voting.",
+    )
+    parser_report.add_argument(
+        "--min-pass-rate",
+        type=float,
+        default=None,
+        help="Minimum fraction of cases (0.0-1.0) that must pass; exits 1 if below threshold or 0 cases ran.",
+    )
+    parser_report.add_argument(
+        "--infra-retries",
+        type=int,
+        default=2,
+        help=(
+            "Number of automatic retries for simulations that fail due to "
+            "infrastructure or inconclusive turns. Defaults to 2 (set to 0 to disable)."
+        ),
+    )
+    parser_report.add_argument(
+        "--retry-parallel",
+        type=int,
+        default=None,
+        help=(
+            "Worker parallelism during simulation retry waves. "
+            "Defaults to max(1, sim_parallel // 2)."
+        ),
+    )
+    parser_report.add_argument(
+        "--retry-cooldown",
+        type=float,
+        default=60.0,
+        help="Cooldown in seconds before each simulation retry wave. Defaults to 60.",
+    )
+    parser_report.add_argument(
+        "--golden-run-method",
+        choices=["STABLE", "NAIVE"],
+        default="STABLE",
+        help="Method used to replay golden evaluations (STABLE or NAIVE). Defaults to STABLE.",
+    )
+    parser_report.add_argument(
+        "--gcs-bundle-uri",
+        default=None,
+        help="Optional GCS prefix (gs://bucket/path) to upload the report bundle and latest-<suite>.html pointer.",
+    )
+    parser_report.add_argument(
+        "--suite-name",
+        default=None,
+        help="Optional suite identifier used for EVAL_STAMP-<suite>.txt, latest-<suite>.html, and step summaries.",
+    )
+    parser_report.add_argument(
+        "--github-step-summary",
+        action="store_true",
+        default=False,
+        help="Append a Markdown pass/fail table and report links to GITHUB_STEP_SUMMARY.",
+    )
     parser_report.set_defaults(func=combined_evals_report_cmd)
 
     parser_test_tools = subparsers.add_parser(
@@ -2079,7 +2212,24 @@ def get_parser() -> argparse.ArgumentParser:
     parser_push_eval.add_argument(
         "--file",
         required=True,
-        help="Path to the YAML file containing evaluation definitions.",
+        help="Path to a YAML file or directory containing evaluation definitions.",
+    )
+    parser_push_eval.add_argument(
+        "--prune",
+        action="store_true",
+        default=False,
+        help="Delete server evaluations not present in the local YAML definitions.",
+    )
+    parser_push_eval.add_argument(
+        "--prune-tag",
+        default=None,
+        help="Only prune server evaluations that carry this tag and are absent from local YAML files.",
+    )
+    parser_push_eval.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Preview evaluation upsert and prune actions without mutating the server.",
     )
     parser_push_eval.set_defaults(func=push_eval)
 
@@ -2144,6 +2294,24 @@ def get_parser() -> argparse.ArgumentParser:
             "Method used to replay golden tests (STABLE or NAIVE). "
             "Defaults to STABLE."
         ),
+    )
+    parser_run.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of evaluation runs to execute for k-of-N reconciliation.",
+    )
+    parser_run.add_argument(
+        "--min-run-passes",
+        type=int,
+        default=None,
+        help="Minimum passing runs per evaluation for k-of-N voting.",
+    )
+    parser_run.add_argument(
+        "--min-pass-rate",
+        type=float,
+        default=None,
+        help="Minimum fraction of evaluations (0.0-1.0) that must pass; fails closed if 0 run.",
     )
 
     parser_run.set_defaults(func=run_eval)

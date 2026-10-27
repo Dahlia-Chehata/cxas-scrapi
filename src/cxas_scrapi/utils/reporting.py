@@ -4751,15 +4751,20 @@ def _build_turn_comparisons(
 
 
 def load_golden_results(
-    run_id: str, app_name: str, include: list[str] | None = None
+    run_id: str | list[str],
+    app_name: str,
+    include: list[str] | None = None,
+    min_run_passes: int | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch golden results and parse into report-friendly format.
 
     Args:
-      run_id: The evaluation run ID to load results for.
+      run_id: Evaluation run ID (or comma-separated IDs / list of IDs) to load.
       app_name: CX Agent Studio (CXAS) agent resource name.
       include: Categories of evaluations to include (e.g. 'goldens',
         'scenarios').
+      min_run_passes: Optional k-of-N pass threshold when reconciling multiple
+        evaluation runs.
 
     Returns:
       A list of formatted evaluation result dictionaries.
@@ -4767,20 +4772,33 @@ def load_golden_results(
     if include is None:
         include = ["goldens", "scenarios"]
 
-    utils = eval_utils.EvalUtils(app_name=app_name)
-    full_run_id = (
-        run_id
-        if run_id.startswith("projects/")
-        else f"{app_name}/evaluationRuns/{run_id}"
-    )
+    if isinstance(run_id, str):
+        run_ids = [rid.strip() for rid in run_id.split(",") if rid.strip()]
+    else:
+        run_ids = [str(rid).strip() for rid in run_id if str(rid).strip()]
 
-    raw_results = utils.list_evaluation_results_by_run(full_run_id)
+    utils = eval_utils.EvalUtils(app_name=app_name)
+    raw_results = []
+    for rid in run_ids:
+        full_run_id = (
+            rid
+            if rid.startswith("projects/")
+            else f"{app_name}/evaluationRuns/{rid}"
+        )
+        raw_results.extend(utils.list_evaluation_results_by_run(full_run_id))
 
     evals_map = utils.get_evaluations_map(app_name, reverse=False)
     name_lookup = {}
     for cat in ["goldens", "scenarios"]:
         for resource, display in evals_map.get(cat, {}).items():
             name_lookup[resource] = display
+
+    evals_by_resource: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        for ev_item in utils.list_evaluations(app_name) or []:
+            ev_name = getattr(ev_item, "name", "")
+            if ev_name:
+                evals_by_resource[ev_name] = ev_item
 
     results = []
     for r in raw_results:
@@ -4849,7 +4867,10 @@ def load_golden_results(
         # One entry per golden turn: ("text", "...") or ("event", "...")
         turn_inputs = []
         try:
-            ev_obj = utils.get_evaluation(eval_resource)
+            ev_obj = evals_by_resource.get(eval_resource)
+            if ev_obj is None:
+                ev_obj = utils.get_evaluation(eval_resource)
+                evals_by_resource[eval_resource] = ev_obj
             evd = type(ev_obj).to_dict(ev_obj)
             golden_def = evd.get("golden", {})
             for turn_def in golden_def.get("turns", []):
@@ -4899,7 +4920,47 @@ def load_golden_results(
             }
         )
 
+    if min_run_passes is not None or len(run_ids) > 1:
+        return reconcile_golden_runs(
+            results, min_run_passes=min_run_passes or 1
+        )
+
     return results
+
+
+def reconcile_golden_runs(
+    results: list[dict[str, Any]],
+    min_run_passes: int = 1,
+) -> list[dict[str, Any]]:
+    """Reconcile multiple golden runs per evaluation using k-of-N voting."""
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for r in results:
+        name = r.get("name", "?")
+        if name not in by_name:
+            by_name[name] = []
+            order.append(name)
+        by_name[name].append(r)
+
+    reconciled: list[dict[str, Any]] = []
+    for name in order:
+        runs = by_name[name]
+        passes = sum(1 for r in runs if r.get("passed"))
+        passed = passes >= min_run_passes
+        failing = [r for r in runs if not r.get("passed")]
+        passing = [r for r in runs if r.get("passed")]
+        chosen = dict(
+            passing[0]
+            if passed and passing
+            else (failing[0] if failing else runs[0])
+        )
+        chosen["passed"] = passed
+        chosen["passes"] = passes
+        chosen["runs"] = len(runs)
+        if failing:
+            chosen["failed_runs"] = len(failing)
+        reconciled.append(chosen)
+    return reconciled
 
 
 def _merge_naturalness(common: Any, case: Any) -> Any:
@@ -5067,6 +5128,273 @@ def load_callback_test_results(csv_or_json_path: str) -> list[dict[str, Any]]:
     return results
 
 
+def summarize_and_gate_evals(
+    sim_results: list[dict[str, Any]] | None = None,
+    golden_results: list[dict[str, Any]] | None = None,
+    tool_results: list[dict[str, Any]] | None = None,
+    callback_results: list[dict[str, Any]] | None = None,
+    min_run_passes: int = 1,
+    min_pass_rate: float | None = None,
+) -> dict[str, Any]:
+    """Compute k-of-N case pass rates and evaluate gate criteria."""
+    all_cases: list[dict[str, Any]] = []
+
+    def _collect_grouped(
+        items: list[dict[str, Any]] | None, category: str
+    ) -> None:
+        if not items:
+            return
+        by_name: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        for item in items:
+            name = str(item.get("name", item.get("test_name", "?")))
+            if name not in by_name:
+                by_name[name] = []
+                order.append(name)
+            by_name[name].append(item)
+
+        for name in order:
+            runs = by_name[name]
+            if len(runs) == 1 and "passes" in runs[0] and "runs" in runs[0]:
+                passes = int(runs[0]["passes"])
+                total_runs = int(runs[0]["runs"])
+            else:
+                passes = sum(1 for r in runs if r.get("passed"))
+                total_runs = len(runs)
+            passed = passes >= min_run_passes
+            failed_expectations: list[str] = []
+            for r in runs:
+                for exp in r.get("expectations", []) or []:
+                    if exp.get("status") != "Met":
+                        exp_name = exp.get("expectation", "")
+                        if exp_name and exp_name not in failed_expectations:
+                            failed_expectations.append(exp_name)
+            all_cases.append(
+                {
+                    "name": name,
+                    "category": category,
+                    "passed": passed,
+                    "passes": passes,
+                    "runs": total_runs,
+                    "failed_expectations": failed_expectations,
+                }
+            )
+
+    _collect_grouped(sim_results, "simulation")
+    _collect_grouped(golden_results, "golden")
+    _collect_grouped(tool_results, "tool")
+    _collect_grouped(callback_results, "callback")
+
+    total = len(all_cases)
+    passed_count = sum(1 for c in all_cases if c["passed"])
+    pass_rate = (passed_count / total) if total > 0 else 0.0
+    max_runs = max((c["runs"] for c in all_cases), default=1)
+
+    for c in all_cases:
+        tag = "PASS" if c["passed"] else "FAIL"
+        print(f"  [{tag}] {c['name']} ({c['passes']}/{c['runs']} runs)")
+        if not c["passed"]:
+            for exp_text in c["failed_expectations"]:
+                print(f"         NOT MET: {exp_text}")
+
+    rule_label = (
+        f" ({min_run_passes}-of-{max_runs})"
+        if max_runs > 1 or min_run_passes > 1
+        else ""
+    )
+    print(f"----- {passed_count}/{total} cases passed{rule_label} -----")
+
+    gate_passed = True
+    gate_reason = ""
+    if min_pass_rate is not None:
+        if total == 0:
+            gate_passed = False
+            gate_reason = "No evaluations ran — failing closed"
+            print(f"::error::{gate_reason}")
+        elif pass_rate < min_pass_rate:
+            gate_passed = False
+            gate_reason = (
+                f"Pass rate {passed_count}/{total} ({pass_rate:.0%}) "
+                f"is below threshold {min_pass_rate:.0%}"
+            )
+            print(f"::error::{gate_reason}")
+
+    return {
+        "passed_cases": passed_count,
+        "total_cases": total,
+        "pass_rate": pass_rate,
+        "min_run_passes": min_run_passes,
+        "min_pass_rate": min_pass_rate,
+        "gate_passed": gate_passed,
+        "gate_reason": gate_reason,
+        "cases": all_cases,
+    }
+
+
+def write_eval_stamp(
+    output_dir: str,
+    suite_name: str,
+    gate_summary: dict[str, Any],
+    modality: str = "text",
+    runs: int = 1,
+) -> str:
+    """Write an EVAL_STAMP-<suite>.txt metadata file into output_dir."""
+    safe_suite = (
+        re.sub(r"[^a-zA-Z0-9._-]+", "-", suite_name).strip("-") or "evals"
+    )
+    stamp_path = os.path.join(output_dir, f"EVAL_STAMP-{safe_suite}.txt")
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    lines = [
+        f"suite:         {suite_name}",
+        f"modality:      {modality}",
+        f"runs:          {runs}",
+        f"min_passes:    {gate_summary.get('min_run_passes', 1)}",
+        f"min_pass_rate: {gate_summary.get('min_pass_rate')}",
+        (
+            f"cases_passed:  {gate_summary.get('passed_cases', 0)}/"
+            f"{gate_summary.get('total_cases', 0)}"
+        ),
+        f"pass_rate:     {gate_summary.get('pass_rate', 0.0):.2%}",
+        f"gate_passed:   {gate_summary.get('gate_passed', True)}",
+        f"git_sha:       {os.environ.get('GITHUB_SHA', 'local')}",
+        f"git_ref:       {os.environ.get('GITHUB_REF_NAME', 'local')}",
+        f"run_id:        {os.environ.get('GITHUB_RUN_ID', 'local')}",
+        f"timestamp_utc: {now_utc}",
+    ]
+    with _ORIG_OPEN(stamp_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return stamp_path
+
+
+def publish_eval_report_bundle(
+    output_dir: str,
+    report_path: str,
+    gcs_bundle_uri: str,
+    suite_name: str | None = None,
+) -> dict[str, str]:
+    """Upload report HTML, raw artifacts, and latest pointer to GCS."""
+    base_uri = gcs_bundle_uri.rstrip("/")
+    uploader = gcs_utils.GCSUtils()
+    uploaded: dict[str, str] = {}
+
+    if os.path.isfile(report_path):
+        report_uri = f"{base_uri}/report.html"
+        uploaded["report_url"] = uploader.upload_file(
+            report_uri,
+            report_path,
+            content_type="text/html; charset=utf-8",
+        )
+        uploaded["report_gcs_uri"] = report_uri
+
+    patterns = [
+        "sim_results*.json",
+        "ces_results*.json",
+        "sim_cases*.yaml",
+        "tool_test_results*.csv",
+        "tool_test_results*.json",
+        "callback_test_results*.csv",
+        "callback_test_results*.json",
+        "EVAL_STAMP*.txt",
+    ]
+    for pat in patterns:
+        for local_file in sorted(glob.glob(os.path.join(output_dir, pat))):
+            if os.path.isfile(local_file):
+                fname = os.path.basename(local_file)
+                dest_uri = f"{base_uri}/{fname}"
+                ctype = (
+                    "application/json"
+                    if fname.endswith(".json")
+                    else "text/plain; charset=utf-8"
+                )
+                uploader.upload_file(dest_uri, local_file, content_type=ctype)
+
+    if suite_name and os.path.isfile(report_path):
+        safe_suite = (
+            re.sub(r"[^a-zA-Z0-9._-]+", "-", suite_name).strip("-") or "evals"
+        )
+        parent_uri = "/".join(base_uri.split("/")[:-1])
+        if parent_uri.startswith("gs://") and len(parent_uri) > len("gs://"):
+            latest_uri = f"{parent_uri}/latest-{safe_suite}.html"
+        else:
+            latest_uri = f"{base_uri}/latest-{safe_suite}.html"
+        uploaded["latest_url"] = uploader.upload_file(
+            latest_uri,
+            report_path,
+            content_type="text/html; charset=utf-8",
+            cache_control="no-cache, max-age=0",
+        )
+        uploaded["latest_gcs_uri"] = latest_uri
+
+    return uploaded
+
+
+def write_github_step_summary(
+    gate_summary: dict[str, Any],
+    suite_name: str | None = None,
+    published_urls: dict[str, str] | None = None,
+    summary_path: str | None = None,
+) -> str | None:
+    """Write a Markdown summary table and links to GITHUB_STEP_SUMMARY."""
+    target_path = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
+    if not target_path:
+        return None
+
+    title = f"### {suite_name}" if suite_name else "### Evaluation Summary"
+    passed = gate_summary.get("passed_cases", 0)
+    total = gate_summary.get("total_cases", 0)
+    min_passes = gate_summary.get("min_run_passes", 1)
+    cases = gate_summary.get("cases", [])
+    max_runs = max((c.get("runs", 1) for c in cases), default=1)
+    rule_note = (
+        f" ({min_passes}-of-{max_runs} pass rule)"
+        if max_runs > 1 or min_passes > 1
+        else ""
+    )
+
+    lines = [
+        title,
+        "",
+        f"**{passed} / {total} cases passed**{rule_note}",
+        "",
+    ]
+
+    if published_urls:
+        link_parts = []
+        if published_urls.get("report_url"):
+            link_parts.append(
+                f"[Open HTML Report]({published_urls['report_url']})"
+            )
+        if published_urls.get("latest_url"):
+            link_parts.append(
+                f"[Latest for branch]({published_urls['latest_url']})"
+            )
+        if link_parts:
+            lines.append(" · ".join(link_parts))
+            lines.append("")
+
+    if cases:
+        lines.extend(
+            [
+                "| Status | Case | Runs Passed |",
+                "| :---: | :--- | :---: |",
+            ]
+        )
+        for c in cases:
+            status_str = "PASS" if c.get("passed") else "FAIL"
+            lines.append(
+                f"| {status_str} | `{c.get('name', '?')}` | "
+                f"{c.get('passes', 0)}/{c.get('runs', 1)} |"
+            )
+        lines.append("")
+
+    content = "\n".join(lines) + "\n"
+    with _ORIG_OPEN(target_path, "a") as f:
+        f.write(content)
+    return target_path
+
+
 def generate_combined_report_from_dir(
     output_dir: str,
     golden_run: str | None = None,
@@ -5102,7 +5430,17 @@ def generate_combined_report_from_dir(
     vertex_location: str = "global",
     naturalness: bool | dict[str, Any] | None = None,
     audio_analysis: bool | None = None,
-) -> str:
+    infra_retries: int = 2,
+    retry_parallel: int | None = None,
+    retry_cooldown: float = 60.0,
+    golden_run_method: str = "STABLE",
+    min_run_passes: int | None = None,
+    min_pass_rate: float | None = None,
+    gcs_bundle_uri: str | None = None,
+    suite_name: str | None = None,
+    github_step_summary: bool = False,
+    return_gate_status: bool = False,
+) -> str | tuple[str, dict[str, Any]]:
     """Load results from directory and generate a combined report.
 
     Args:
@@ -5158,6 +5496,15 @@ def generate_combined_report_from_dir(
     resolved_timestamp = timestamp
 
     if run:
+        extra_run_kwargs: dict[str, Any] = {}
+        if infra_retries != 2:
+            extra_run_kwargs["infra_retries"] = infra_retries
+        if retry_parallel is not None:
+            extra_run_kwargs["retry_parallel"] = retry_parallel
+        if retry_cooldown != 60.0:
+            extra_run_kwargs["retry_cooldown"] = retry_cooldown
+        if golden_run_method != "STABLE":
+            extra_run_kwargs["golden_run_method"] = golden_run_method
         run_results = run_all_evals(
             app_name=app_name,
             app_dir=app_dir,
@@ -5189,6 +5536,7 @@ def generate_combined_report_from_dir(
             vertex_location=vertex_location,
             naturalness=naturalness,
             audio_analysis=bool(audio_analysis),
+            **extra_run_kwargs,
         )
         sim_results = run_results["simulation"] if "sims" in include else []
         # Map tool results to expected format if needed
@@ -5322,9 +5670,28 @@ def generate_combined_report_from_dir(
                 raise ValueError(
                     "--app-name is required when golden_run is specified."
                 )
+            extra_golden_kwargs: dict[str, Any] = {}
+            if min_run_passes is not None:
+                extra_golden_kwargs["min_run_passes"] = min_run_passes
             golden_results = load_golden_results(
-                golden_run, app_name, include=include
+                golden_run, app_name, include=include, **extra_golden_kwargs
             )
+        elif "goldens" in include:
+            ces_files = glob.glob(os.path.join(output_dir, "ces_results*.json"))
+            if ces_files:
+                ces_files.sort(key=os.path.getmtime)
+                latest_ces_file = ces_files[-1]
+                with open(latest_ces_file) as f:
+                    ces_data = json.load(f)
+                    if isinstance(ces_data, list):
+                        golden_results = ces_data
+                    elif isinstance(ces_data, dict):
+                        golden_results = ces_data.get("results", [])
+
+    if min_run_passes is not None and golden_results and not golden_run:
+        golden_results = reconcile_golden_runs(
+            golden_results, min_run_passes=min_run_passes
+        )
 
     if not output_path:
         default_filename = (
@@ -5338,7 +5705,7 @@ def generate_combined_report_from_dir(
         output_path = os.path.join(output_dir, report_name)
 
     if report_format == "json":
-        return generate_combined_json_report(
+        actual_path = generate_combined_json_report(
             golden_results=golden_results,
             sim_results=sim_results,
             tool_results=tool_results,
@@ -5349,20 +5716,66 @@ def generate_combined_report_from_dir(
             sim_modality=modality,
             audio_analysis=audio_analysis,
         )
+    else:
+        actual_path = generate_combined_html_report(
+            golden_results=golden_results,
+            sim_results=sim_results,
+            tool_results=tool_results,
+            callback_results=callback_results,
+            output_path=output_path,
+            app_name=app_name or "",
+            golden_modality=modality,
+            sim_modality=modality,
+            bg_noise_file=bg_noise_file,
+            burst_noise_files=burst_noise_files,
+            audio_analysis=audio_analysis,
+        )
 
-    actual_path = generate_combined_html_report(
-        golden_results=golden_results,
-        sim_results=sim_results,
-        tool_results=tool_results,
-        callback_results=callback_results,
-        output_path=output_path,
-        app_name=app_name or "",
-        golden_modality=modality,
-        sim_modality=modality,
-        bg_noise_file=bg_noise_file,
-        burst_noise_files=burst_noise_files,
-        audio_analysis=audio_analysis,
+    should_gate_or_publish = any(
+        [
+            min_run_passes is not None,
+            min_pass_rate is not None,
+            gcs_bundle_uri is not None,
+            suite_name is not None,
+            github_step_summary,
+            return_gate_status,
+        ]
     )
+    if should_gate_or_publish:
+        gate_summary = summarize_and_gate_evals(
+            sim_results=sim_results,
+            golden_results=golden_results,
+            tool_results=tool_results,
+            callback_results=callback_results,
+            min_run_passes=min_run_passes or 1,
+            min_pass_rate=min_pass_rate,
+        )
+        if suite_name:
+            write_eval_stamp(
+                output_dir=output_dir,
+                suite_name=suite_name,
+                gate_summary=gate_summary,
+                modality=modality,
+                runs=runs,
+            )
+        published_urls: dict[str, str] = {}
+        if gcs_bundle_uri:
+            published_urls = publish_eval_report_bundle(
+                output_dir=output_dir,
+                report_path=actual_path,
+                gcs_bundle_uri=gcs_bundle_uri,
+                suite_name=suite_name,
+            )
+            gate_summary["published_urls"] = published_urls
+        if github_step_summary:
+            write_github_step_summary(
+                gate_summary=gate_summary,
+                suite_name=suite_name,
+                published_urls=published_urls,
+            )
+        if return_gate_status:
+            return actual_path, gate_summary
+
     return actual_path
 
 
@@ -5397,9 +5810,10 @@ def run_all_evals(
     vertex_location: str = "global",
     naturalness: bool | dict[str, Any] | None = None,
     audio_analysis: bool = False,
-    infra_retries: int = 0,
+    infra_retries: int = 2,
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
+    golden_run_method: str = "STABLE",
 ) -> dict[str, Any]:
     """Runs all 4 types of evaluations and returns aggregated results.
 
@@ -5439,7 +5853,7 @@ def run_all_evals(
       'callback'.
     """
     extra_kwargs: dict[str, Any] = {}
-    if infra_retries:
+    if infra_retries != 2:
         extra_kwargs["infra_retries"] = infra_retries
     if retry_parallel is not None:
         extra_kwargs["retry_parallel"] = retry_parallel
@@ -5447,6 +5861,8 @@ def run_all_evals(
         extra_kwargs["retry_cooldown"] = retry_cooldown
     if audio_analysis:
         extra_kwargs["audio_analysis"] = audio_analysis
+    if golden_run_method != "STABLE":
+        extra_kwargs["golden_run_method"] = golden_run_method
     return evals_runner.run_all_evals(
         app_name=app_name,
         modality=modality,

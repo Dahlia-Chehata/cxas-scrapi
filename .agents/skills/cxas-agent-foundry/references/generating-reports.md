@@ -35,6 +35,19 @@ cxas evals report \
   --modality audio \
   --audio-analysis \
   --output-dir <project>/eval-reports
+
+# Run with k-of-N majority voting, infra retries, pass-rate gate, and GCS bundle upload
+cxas evals report \
+  --run \
+  --app-name "$APP_NAME" \
+  --modality audio \
+  --runs 3 \
+  --min-run-passes 2 \
+  --min-pass-rate 0.85 \
+  --suite-name sims-audio \
+  --gcs-bundle-uri "gs://my-bucket/evals/main/run-1" \
+  --github-step-summary \
+  --output-dir <project>/eval-reports
 ```
 
 Output: Interactive HTML report (`combined_eval_report.html`) and machine-readable JSON (`combined_eval_report.json`). Includes:

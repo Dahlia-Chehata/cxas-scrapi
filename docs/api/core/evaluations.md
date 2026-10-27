@@ -12,6 +12,7 @@ A few things worth knowing about this class:
 - **`export_evaluation()`** converts a CXAS evaluation into a human-readable YAML or JSON file, with evaluation expectations sideloaded as separate JSON files.
 - **`ExportFormat`** is a simple enum: `ExportFormat.YAML` (default) or `ExportFormat.JSON`.
 - **`bulk_export_evals()`** is a convenience wrapper that exports every evaluation of a given type to a local directory in one go.
+- **`update_evaluation()`** and **`sync_evaluations()`** automatically resolve tool `displayName` references in expectations to server-minted tool resource IDs, fall back to `delete` + `create` when `UpdateEvaluation` returns `501 Not Implemented`, and support tag-scoped pruning (`prune_tag`).
 
 ## Quick Example
 

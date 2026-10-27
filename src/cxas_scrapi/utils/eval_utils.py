@@ -426,22 +426,32 @@ class EvalUtils(Evaluations):
         if isinstance(eval_names, str):
             eval_names = [eval_names]
 
+        eval_cache = {}
         if results is None:
             results = []
             evaluations = self.list_evaluations(self.app_name)
+            seen_eval_resources: set[str] = set()
             for evaluation in evaluations:
+                eval_res_name = getattr(evaluation, "name", "")
+                if eval_res_name:
+                    eval_cache[eval_res_name] = getattr(
+                        evaluation, "display_name", "Unknown Evaluation"
+                    )
+                if eval_res_name in seen_eval_resources:
+                    continue
                 if (
                     eval_names
                     and evaluation.display_name not in eval_names
-                    and evaluation.name not in eval_names
+                    and eval_res_name not in eval_names
                 ):
                     continue
-                results.extend(self.list_evaluation_results(evaluation.name))
+                if eval_res_name:
+                    seen_eval_resources.add(eval_res_name)
+                results.extend(self.list_evaluation_results(eval_res_name))
 
         run_summaries = []
         expectations = []
         turns = []
-        eval_cache = {}
 
         for result in results:
             res_dict = type(result).to_dict(result)

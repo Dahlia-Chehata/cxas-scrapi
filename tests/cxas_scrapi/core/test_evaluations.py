@@ -14,6 +14,7 @@
 
 import json
 import typing
+from types import SimpleNamespace
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -804,3 +805,140 @@ def test_bulk_export_evals(
     mock_makedirs.side_effect = PermissionError("Permission denied")
     with pytest.raises(PermissionError):
         evals_client.bulk_export_evals("scenarios", "/invalid/dir")
+
+
+@patch("cxas_scrapi.core.evaluations.EvaluationServiceClient")
+def test_list_evaluation_results_by_run_parallel(
+    mock_client_cls: typing.Any,
+) -> None:
+    evals_client = Evaluations(app_name="projects/p/locations/l/apps/a")
+    evals_client.client.get_evaluation_run.return_value = SimpleNamespace(
+        evaluation_results=[
+            "projects/p/locations/l/apps/a/evaluations/e1/results/r1",
+            "projects/p/locations/l/apps/a/evaluations/e2/results/r2",
+            "projects/p/locations/l/apps/a/evaluations/e3/results/r3",
+        ]
+    )
+    evals_client.client.get_evaluation_result.side_effect = lambda name: (
+        SimpleNamespace(name=name)
+    )
+
+    res = evals_client.list_evaluation_results_by_run(
+        "projects/p/locations/l/apps/a/evaluationRuns/run-1"
+    )
+    assert [r.name for r in res] == [
+        "projects/p/locations/l/apps/a/evaluations/e1/results/r1",
+        "projects/p/locations/l/apps/a/evaluations/e2/results/r2",
+        "projects/p/locations/l/apps/a/evaluations/e3/results/r3",
+    ]
+
+
+@patch("cxas_scrapi.core.evaluations.Tools")
+@patch("cxas_scrapi.core.evaluations.EvaluationServiceClient")
+def test_update_evaluation_falls_back_to_replace_on_501(
+    mock_client_cls: typing.Any,
+    mock_tools_cls: typing.Any,
+) -> None:
+    evals_client = Evaluations(app_name="projects/p/locations/l/apps/a")
+    mock_tools_cls.return_value.get_tools_map.return_value = {
+        "lookup_account": "projects/p/locations/l/apps/a/tools/tool-123"
+    }
+    evals_client.list_evaluations = MagicMock(
+        return_value=[
+            SimpleNamespace(
+                name="projects/p/locations/l/apps/a/evaluations/ev-old",
+                display_name="golden_case_1",
+            )
+        ]
+    )
+    evals_client.client.update_evaluation.side_effect = RuntimeError(
+        "501 Not Implemented: UpdateEvaluation is not implemented"
+    )
+    evals_client.delete_evaluation = MagicMock()
+    evals_client.create_evaluation = MagicMock(
+        return_value=SimpleNamespace(
+            name="projects/p/locations/l/apps/a/evaluations/ev-new",
+            display_name="golden_case_1",
+        )
+    )
+
+    payload = {
+        "displayName": "golden_case_1",
+        "golden": {
+            "turns": [
+                {
+                    "steps": [
+                        {
+                            "expectation": {
+                                "toolCall": {"displayName": "lookup_account"}
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+    }
+    res = evals_client.update_evaluation(
+        evaluation=payload,
+        app_name="projects/p/locations/l/apps/a",
+    )
+
+    evals_client.delete_evaluation.assert_called_once_with(
+        name="projects/p/locations/l/apps/a/evaluations/ev-old",
+        force=True,
+    )
+    evals_client.create_evaluation.assert_called_once()
+    assert (
+        payload["golden"]["turns"][0]["steps"][0]["expectation"]["toolCall"][
+            "tool"
+        ]
+        == "projects/p/locations/l/apps/a/tools/tool-123"
+    )
+    assert res.name == "projects/p/locations/l/apps/a/evaluations/ev-new"
+
+
+@patch("cxas_scrapi.core.evaluations.Tools")
+@patch("cxas_scrapi.core.evaluations.EvaluationServiceClient")
+def test_sync_evaluations_upserts_and_prunes_by_tag(
+    mock_client_cls: typing.Any,
+    mock_tools_cls: typing.Any,
+) -> None:
+    evals_client = Evaluations(app_name="projects/p/locations/l/apps/a")
+    mock_tools_cls.return_value.get_tools_map.return_value = {}
+    evals_client.list_evaluations = MagicMock(
+        return_value=[
+            SimpleNamespace(
+                name="projects/p/locations/l/apps/a/evaluations/ev-keep",
+                display_name="case_keep",
+                tags=["tool-eval"],
+            ),
+            SimpleNamespace(
+                name="projects/p/locations/l/apps/a/evaluations/ev-stale",
+                display_name="case_stale",
+                tags=["tool-eval"],
+            ),
+            SimpleNamespace(
+                name="projects/p/locations/l/apps/a/evaluations/ev-other",
+                display_name="case_other",
+                tags=["other-suite"],
+            ),
+        ]
+    )
+    evals_client.delete_evaluation = MagicMock()
+    evals_client.create_evaluation = MagicMock(
+        return_value=SimpleNamespace(
+            name="projects/p/locations/l/apps/a/evaluations/ev-keep-new",
+            display_name="case_keep",
+        )
+    )
+
+    summary = evals_client.sync_evaluations(
+        evaluations=[{"displayName": "case_keep", "tags": ["tool-eval"]}],
+        app_name="projects/p/locations/l/apps/a",
+        prune=True,
+        prune_tag="tool-eval",
+    )
+
+    assert summary["pushed"] == ["case_keep"]
+    assert summary["pruned"] == ["case_stale"]
+    assert evals_client.delete_evaluation.call_count == 2
