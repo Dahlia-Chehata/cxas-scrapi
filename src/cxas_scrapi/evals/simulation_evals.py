@@ -34,6 +34,7 @@ from typing import Any
 import pandas as pd
 import pydantic
 import yaml
+from google import genai
 from rich.progress import Progress
 
 from cxas_scrapi.core.apps import Apps
@@ -41,7 +42,7 @@ from cxas_scrapi.core.conversation_history import ConversationHistory
 from cxas_scrapi.core.response_parser import ParsedSessionResponse
 from cxas_scrapi.core.sessions import BidiSessionError, Sessions
 from cxas_scrapi.core.tools import Tools
-from cxas_scrapi.core.traces import Traces
+from cxas_scrapi.core.traces import Traces, _parse_pass_fail
 from cxas_scrapi.evals.naturalness import (
     NaturalnessConfig,
     NaturalnessResult,
@@ -66,6 +67,9 @@ from cxas_scrapi.utils.eval_utils import (
 from cxas_scrapi.utils.gemini import GeminiGenerate
 from cxas_scrapi.utils.rate_limiter import RateLimiter
 from cxas_scrapi.utils.tracing import trace_report
+from cxas_scrapi.utils.tracing.audio_analysis import ANALYSIS_REGISTRY
+from cxas_scrapi.utils.tracing.audio_drift import flag_drift
+from cxas_scrapi.utils.tracing.audio_metrics import measure_call
 
 logger = logging.getLogger(__name__)
 
@@ -567,6 +571,7 @@ class SimulationEvals(Apps):
         deployment_id: str | None = None,
         vertex_location: str = "global",
         naturalness: bool | dict[str, Any] | None = None,
+        audio_analysis: bool = False,
         **kwargs: typing.Any,
     ) -> None:
         self.expectations_only = expectations_only
@@ -575,6 +580,7 @@ class SimulationEvals(Apps):
         # defers entirely to each test case; True enables it everywhere with
         # defaults; a dict is merged over the test case's own block.
         self.naturalness = naturalness
+        self.audio_analysis = audio_analysis
         project_id = app_name.split("/")[1]
         location = app_name.split("/")[3]
         super().__init__(project_id=project_id, location=location, **kwargs)
@@ -830,6 +836,177 @@ class SimulationEvals(Apps):
             latency_ms_by_turn=latencies,
         )
 
+    def _evaluate_audio_analysis(
+        self,
+        eval_conv: LLMUserConversation,
+        detailed_trace: list[str],
+        turn_traces: list[dict[str, Any]],
+        eval_model: str,
+        console_logging: bool,
+        session_id: str = "",
+        modality: str = "text",
+    ) -> None:
+        """Runs comprehensive audio analysis (multimodal audio checks,
+        signal-level acoustic metrics, and voice drift detection).
+
+        Sets `eval_conv.audio_analysis_result`,
+        `eval_conv.audio_metrics_result`, and `eval_conv.audio_drift_result`.
+        """
+        if console_logging:
+            print("\nEvaluating Audio Analysis...")
+
+        # 1. Multimodal Gemini Audio Checks
+        try:
+            traces = Traces(app_name=self.app_name, creds=self.creds)
+            res = traces.analyze_audio(session_id)
+            if isinstance(res, dict) and not res.get("error"):
+                eval_conv.audio_analysis_result = res
+            elif getattr(eval_conv, "agent_audio_paths", None):
+                local_paths_dict = eval_conv.agent_audio_paths
+                sorted_turns = sorted(local_paths_dict.keys())
+                local_wavs = [
+                    local_paths_dict[t]
+                    for t in sorted_turns
+                    if os.path.exists(local_paths_dict[t])
+                ]
+                if local_wavs:
+                    audio_parts = []
+                    for wav_path in local_wavs:
+                        try:
+                            with open(wav_path, "rb") as wf:
+                                audio_bytes = wf.read()
+                            audio_parts.append(
+                                genai.types.Part.from_bytes(
+                                    data=audio_bytes, mime_type="audio/wav"
+                                )
+                            )
+                        except Exception as read_exc:
+                            logger.warning(
+                                "Failed to read local WAV %s: %s",
+                                wav_path,
+                                read_exc,
+                            )
+                    if audio_parts:
+                        checks_result = {}
+                        for (
+                            analysis_name,
+                            analysis,
+                        ) in ANALYSIS_REGISTRY.items():
+                            if analysis_name == "no_long_pauses":
+                                checks_result[analysis_name] = {
+                                    "result": "SKIP",
+                                    "justification": (
+                                        "Full session audio not available for "
+                                        "pause analysis."
+                                    ),
+                                    "files_analyzed": [],
+                                }
+                                continue
+                            try:
+                                parts = list(audio_parts)
+                                parts.append(analysis.prompt)
+                                resp = self.genai_client.generate_with_parts(
+                                    parts=parts
+                                )
+                                parsed = _parse_pass_fail(resp)
+                                checks_result[analysis_name] = {
+                                    **parsed,
+                                    "files_analyzed": [
+                                        os.path.basename(p) for p in local_wavs
+                                    ],
+                                }
+                            except Exception as check_exc:
+                                logger.warning(
+                                    "Audio check %s failed: %s",
+                                    analysis_name,
+                                    check_exc,
+                                )
+                                checks_result[analysis_name] = {
+                                    "result": "ERROR",
+                                    "justification": str(check_exc),
+                                    "files_analyzed": [],
+                                }
+                        eval_conv.audio_analysis_result = checks_result
+        except Exception as exc:
+            logger.warning(f"Multimodal audio checks failed: {exc}")
+
+        # 2. Signal-level acoustic metrics and voice drift
+        try:
+            measured = None
+            try:
+                traces = Traces(app_name=self.app_name, creds=self.creds)
+                measured_res = traces.measure_audio(session_id)
+                if isinstance(measured_res, dict) and not measured_res.get(
+                    "error"
+                ):
+                    measured = measured_res
+            except Exception:
+                measured = None
+
+            if not measured and getattr(eval_conv, "agent_audio_paths", None):
+                local_paths_dict = eval_conv.agent_audio_paths
+                sorted_turns = sorted(local_paths_dict.keys())
+                local_wavs = [
+                    local_paths_dict[t]
+                    for t in sorted_turns
+                    if os.path.exists(local_paths_dict[t])
+                ]
+                if local_wavs:
+                    try:
+                        call, turns = measure_call(local_wavs)
+                        call["conversation_id"] = session_id
+                        measured = {"call": call, "turns": turns}
+                    except Exception as meas_exc:
+                        logger.warning(
+                            f"Signal-level measurement failed: {meas_exc}"
+                        )
+
+            if (
+                measured
+                and isinstance(measured, dict)
+                and "call" in measured
+                and "turns" in measured
+            ):
+                eval_conv.audio_metrics_result = {
+                    "call": measured.get("call", {}),
+                    "turns": measured.get("turns", []),
+                }
+
+                agent_text_by_turn: dict[int, list[str]] = {}
+                for t in extract_agent_turns(detailed_trace):
+                    agent_text_by_turn.setdefault(t.turn_index, []).append(
+                        t.text
+                    )
+
+                rows = []
+                for turn_item in measured.get("turns", []):
+                    if turn_item.get("skipped"):
+                        continue
+                    t_idx = int(turn_item.get("turn", 0))
+                    conv_turn = t_idx - 1
+                    rows.append(
+                        {
+                            "turn": t_idx,
+                            "dur_s": turn_item.get("dur_s"),
+                            "lufs": turn_item.get("lufs"),
+                            "f0_median_hz": turn_item.get("f0_median_hz"),
+                            "artic_rate": turn_item.get("artic_rate"),
+                            "n_syl": turn_item.get("n_syl"),
+                            "seams": turn_item.get("seams", []),
+                            "agent_text": " | ".join(
+                                agent_text_by_turn.get(conv_turn, [])
+                            ),
+                        }
+                    )
+                rows.sort(key=lambda r: r["turn"])
+                flagged = flag_drift(rows)
+                eval_conv.audio_drift_result = {
+                    "rows": rows,
+                    "flagged": flagged,
+                }
+        except Exception as exc:
+            logger.warning(f"Audio metrics and drift analysis failed: {exc}")
+
     def _send_request_with_retry(
         self,
         session_id: str,
@@ -978,6 +1155,7 @@ class SimulationEvals(Apps):
         single_bidi_stream: bool = False,
         max_turns: int | None = None,
         naturalness: bool | dict[str, Any] | None = None,
+        audio_analysis: bool | None = None,
         **kwargs: Any,
     ) -> LLMUserConversation:
         """Runs the simulated conversation loop.
@@ -996,14 +1174,31 @@ class SimulationEvals(Apps):
             naturalness: Overrides the test case's `naturalness_metric`
                 block. `None` (the default) defers to the test case, so
                 simulations that never declare the metric are unaffected.
+            audio_analysis: Run multimodal audio checks, acoustic metrics,
+                and voice drift analysis. Defaults to instance setting.
         """
         sim_user_model = sim_user_model or _DEFAULT_SIM_USER_MODEL
         eval_model = eval_model or _DEFAULT_EVAL_MODEL
         if session_id is None:
             session_id = str(uuid.uuid4())
+        effective_audio_analysis = (
+            audio_analysis
+            if audio_analysis is not None
+            else getattr(self, "audio_analysis", False)
+        )
+        if (
+            effective_audio_analysis
+            and naturalness is None
+            and getattr(self, "naturalness", None) is None
+        ):
+            effective_naturalness = True
+        else:
+            effective_naturalness = (
+                naturalness if naturalness is not None else self.naturalness
+            )
         naturalness_config = parse_naturalness_config(
             test_case,
-            naturalness if naturalness is not None else self.naturalness,
+            effective_naturalness,
         )
         voice_config = voice_config or test_case.get("voice_config")
         eval_conv = LLMUserConversation(
@@ -1270,6 +1465,16 @@ class SimulationEvals(Apps):
                 session_id=session_id,
                 modality=modality,
             )
+            if effective_audio_analysis:
+                self._evaluate_audio_analysis(
+                    eval_conv=eval_conv,
+                    detailed_trace=detailed_trace,
+                    turn_traces=turn_traces,
+                    eval_model=eval_model,
+                    console_logging=console_logging,
+                    session_id=session_id,
+                    modality=modality,
+                )
             eval_conv._session_id = session_id
             eval_conv.session_id = session_id
             eval_conv._detailed_trace = detailed_trace
@@ -1448,6 +1653,18 @@ class SimulationEvals(Apps):
                 )
                 result["naturalness_details"] = naturalness_result.model_dump()
 
+            audio_analysis_res = getattr(conv, "audio_analysis_result", None)
+            if audio_analysis_res and not audio_analysis_res.get("error"):
+                result["audio_analysis"] = audio_analysis_res
+
+            audio_metrics_res = getattr(conv, "audio_metrics_result", None)
+            if audio_metrics_res and not audio_metrics_res.get("error"):
+                result["audio_metrics"] = audio_metrics_res
+
+            audio_drift_res = getattr(conv, "audio_drift_result", None)
+            if audio_drift_res and not audio_drift_res.get("error"):
+                result["audio_drift"] = audio_drift_res
+
             return result
         except Exception as e:
             print(f"  ERROR  {label}: {e}")
@@ -1585,6 +1802,7 @@ class SimulationEvals(Apps):
         single_bidi_stream: bool = False,
         progress_callback: Callable[[int, int], None] | None = None,
         naturalness: bool | dict[str, Any] | None = None,
+        audio_analysis: bool | None = None,
         infra_retries: int = 0,
         retry_parallel: int | None = None,
         retry_cooldown: float = 60.0,
@@ -1606,6 +1824,8 @@ class SimulationEvals(Apps):
             naturalness: Run-level override for the optional Naturalness
                 Metric. Leave as None to honour each test case's own
                 `naturalness_metric` block.
+            audio_analysis: Run multimodal audio checks, acoustic metrics,
+                and voice drift analysis. Defaults to instance setting.
         """
         sim_user_model = sim_user_model or _DEFAULT_SIM_USER_MODEL
         eval_model = eval_model or _DEFAULT_EVAL_MODEL
@@ -1613,6 +1833,8 @@ class SimulationEvals(Apps):
             # Persist on the instance so wrappers that reimplement the
             # aggregation loop still see the override.
             self.naturalness = naturalness
+        if audio_analysis is not None:
+            self.audio_analysis = audio_analysis
         jobs = self._prepare_simulation_jobs(test_cases, runs)
         results = self._aggregate_simulation_results(
             jobs,

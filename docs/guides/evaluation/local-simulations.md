@@ -534,6 +534,25 @@ cxas evals report \
 
 ---
 
+## Audio Analysis & Voice Quality Evaluation
+
+For audio and voice simulations, `SimulationEvals` can perform comprehensive perceptual and signal-level quality analysis by setting `audio_analysis=True` (off by default):
+
+```python
+sim_evals = SimulationEvals(
+    app_name="projects/my-project/locations/us/apps/my-app",
+    audio_analysis=True,  # Opt-in comprehensive audio evaluation
+)
+```
+
+When `audio_analysis=True`:
+- **Naturalness Grading**: Evaluates the 5-point naturalness rubric across all conversation runs.
+- **Multimodal Audio Checks**: Evaluates 5 Gemini perceptual checks (voice consistency, no long pauses, agent having trouble, agent looping, agent cutoff) directly on agent speech audio.
+- **Signal-Level Acoustic Consistency**: Calculates ITU-R BS.1770 integrated loudness (LUFS), articulation rate, and median pitch (F0 in Hz and semitones).
+- **Voice Drift & Seam Detection**: Detects cross-turn timbre and pitch seams, abrupt loudness steps, audio truncation, and cached-versus-fresh TTS boundaries.
+
+---
+
 ## Tips for writing good simulations
 
 **Keep steps focused**

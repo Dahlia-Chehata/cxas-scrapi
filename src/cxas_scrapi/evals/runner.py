@@ -77,6 +77,7 @@ def run_all_evals(
     capture_agent_audio: bool = False,
     vertex_location: str = "global",
     naturalness: bool | dict[str, typing.Any] | None = None,
+    audio_analysis: bool = False,
     infra_retries: int = 0,
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
@@ -89,6 +90,12 @@ def run_all_evals(
     from cxas_scrapi.utils.reporting import (  # noqa: PLC0415
         _load_sim_test_cases,
     )
+
+    if audio_analysis:
+        if modality == "audio":
+            capture_agent_audio = True
+        if naturalness is None:
+            naturalness = True
 
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -247,14 +254,17 @@ def run_all_evals(
                 ]
 
             if sim_files:
-                sim_evals = SimulationEvals(
-                    app_name=app_name,
-                    rate_limiter=rate_limiter,
-                    expectations_only=expectations_only,
-                    deployment_id=deployment_id,
-                    vertex_location=vertex_location,
-                    naturalness=naturalness,
-                )
+                sim_eval_kwargs: dict[str, typing.Any] = {
+                    "app_name": app_name,
+                    "rate_limiter": rate_limiter,
+                    "expectations_only": expectations_only,
+                    "deployment_id": deployment_id,
+                    "vertex_location": vertex_location,
+                    "naturalness": naturalness,
+                }
+                if audio_analysis:
+                    sim_eval_kwargs["audio_analysis"] = audio_analysis
+                sim_evals = SimulationEvals(**sim_eval_kwargs)
                 test_cases = []
                 for sf in sim_files:
                     cases = _load_sim_test_cases(sf)
@@ -286,6 +296,8 @@ def run_all_evals(
                         sim_kwargs["retry_parallel"] = retry_parallel
                     if retry_cooldown != 60.0:
                         sim_kwargs["retry_cooldown"] = retry_cooldown
+                    if audio_analysis:
+                        sim_kwargs["audio_analysis"] = audio_analysis
                     sim_results = sim_evals.run_simulations(
                         test_cases,
                         runs=runs,
