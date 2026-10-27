@@ -36,6 +36,8 @@ def discover_agent_callbacks(agent_dir: Path) -> list[tuple[str, Path]]:
         "after_agent_callbacks",
         "before_model_callbacks",
         "after_model_callbacks",
+        "before_tool_callbacks",
+        "after_tool_callbacks",
     ]
     for cb_type in callback_types:
         cb_dir = agent_dir / cb_type
@@ -90,6 +92,75 @@ def extract_dynamic_instructions(file_path: Path) -> dict[str, str]:
             f"Warning: Failed to parse AST of {file_path}: {e}", file=sys.stderr
         )
     return dynamic_instructions
+
+
+def build_agent_config_context(agent_dir: Path) -> str:
+    """Builds a summary of declared tools, child agents, and app variables.
+
+    Reads ``<agent_dir>/<agent_dir.name>.json`` for ``tools`` and
+    ``childAgents``, and walks up to ``app.json`` for
+    ``variableDeclarations``. Returns an empty string when no config files
+    exist so callers without config files keep the exact base prompt.
+    """
+    context_lines: list[str] = []
+
+    agent_json = agent_dir / f"{agent_dir.name}.json"
+    if agent_json.exists():
+        try:
+            agent_data = json.loads(agent_json.read_text(encoding="utf-8"))
+            if isinstance(agent_data, dict):
+                tools = agent_data.get("tools")
+                if isinstance(tools, list):
+                    context_lines.append(
+                        f"Declared Agent Tools: {', '.join(map(str, tools)) or '(none)'}"
+                    )
+                child_agents = agent_data.get("childAgents")
+                if isinstance(child_agents, list):
+                    context_lines.append(
+                        f"Declared Child Agents: {', '.join(map(str, child_agents)) or '(none)'}"
+                    )
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    current_dir = agent_dir.resolve()
+    while current_dir != current_dir.parent:
+        app_json = current_dir / "app.json"
+        if app_json.exists():
+            try:
+                app_data = json.loads(app_json.read_text(encoding="utf-8"))
+                if isinstance(app_data, dict):
+                    var_decls = app_data.get("variableDeclarations")
+                    if isinstance(var_decls, list):
+                        var_names: list[str] = []
+                        for decl in var_decls:
+                            if not isinstance(decl, dict):
+                                continue
+                            name = decl.get("name")
+                            if not isinstance(name, str) or not name:
+                                continue
+                            var_names.append(name)
+                            schema = decl.get("schema")
+                            if isinstance(schema, dict):
+                                props = schema.get("properties")
+                                if isinstance(props, dict):
+                                    for prop in sorted(props):
+                                        var_names.append(f"{name}.{prop}")
+                        context_lines.append(
+                            f"Declared App Variables: {', '.join(var_names) or '(none)'}"
+                        )
+            except (json.JSONDecodeError, OSError):
+                pass
+            break
+        current_dir = current_dir.parent
+
+    if not context_lines:
+        return ""
+
+    return (
+        "\n--- BEGIN AGENT CONFIG CONTEXT ---\n"
+        + "\n".join(context_lines)
+        + "\n--- END AGENT CONFIG CONTEXT ---\n"
+    )
 
 
 def resolve_gcp_credentials(
@@ -275,10 +346,14 @@ def llm_lint(args: argparse.Namespace) -> None:
         )
 
     # --- Run Base Lint ---
-    user_prompt = LLM_LINT_USER_PROMPT.format(
-        global_instruction_content=global_instruction_content or "",
-        instruction_content=instruction_content,
-        dynamic_instruction_content="",
+    config_context = build_agent_config_context(agent_path)
+    user_prompt = (
+        LLM_LINT_USER_PROMPT.format(
+            global_instruction_content=global_instruction_content or "",
+            instruction_content=instruction_content,
+            dynamic_instruction_content="",
+        )
+        + config_context
     )
 
     print(
@@ -344,10 +419,14 @@ def llm_lint(args: argparse.Namespace) -> None:
             for state_name, state_instruction in sorted(dynamic_dis.items()):
                 print(f"  - Linting state: {state_name}...")
 
-                user_prompt = LLM_LINT_USER_PROMPT.format(
-                    global_instruction_content=global_instruction_content or "",
-                    instruction_content=instruction_content,
-                    dynamic_instruction_content=state_instruction,
+                user_prompt = (
+                    LLM_LINT_USER_PROMPT.format(
+                        global_instruction_content=global_instruction_content
+                        or "",
+                        instruction_content=instruction_content,
+                        dynamic_instruction_content=state_instruction,
+                    )
+                    + config_context
                 )
 
                 cb_report = gemini_client.generate(

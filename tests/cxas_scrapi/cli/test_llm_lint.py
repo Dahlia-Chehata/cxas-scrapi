@@ -506,3 +506,81 @@ def test_llm_lint_does_not_falsely_trigger_on_unrelated_instructions(
     content = report_file.read_text(encoding="utf-8")
     expected_str = "the agent itself cannot update the value of a variable"
     assert expected_str not in content
+
+
+def test_llm_lint_system_prompt_uses_ces_directive_syntax() -> None:
+    """System prompt should specify uppercase {@TOOL: ...} and {@AGENT: ...}."""
+    assert "{@TOOL:" in LLM_LINT_SYSTEM_PROMPT
+    assert "{@AGENT:" in LLM_LINT_SYSTEM_PROMPT
+    assert "Quotes vs. Backticks" not in LLM_LINT_SYSTEM_PROMPT
+
+
+@mock.patch("cxas_scrapi.cli.llm_lint.GeminiGenerate", autospec=True)
+def test_llm_lint_includes_agent_and_app_config_context(
+    mock_gemini_cls: typing.Any, tmp_path: typing.Any
+) -> None:
+    """When agent.json and app.json exist, their tools/agents/vars are passed."""
+    agent_dir = tmp_path / "agents" / "my-agent"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "instruction.txt").write_text(
+        "Use {@TOOL: get_balance} for {customer.account_id}.", encoding="utf-8"
+    )
+    (agent_dir / "my-agent.json").write_text(
+        json.dumps(
+            {
+                "displayName": "my-agent",
+                "tools": ["get_balance", "end_session"],
+                "childAgents": ["billing_agent"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "app.json").write_text(
+        json.dumps(
+            {
+                "name": "test-app",
+                "variableDeclarations": [
+                    {
+                        "name": "customer",
+                        "schema": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "account_id": {"type": "STRING"},
+                            },
+                        },
+                    },
+                    {"name": "session_locale", "schema": {"type": "STRING"}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "gecx-config.json").write_text(
+        json.dumps(
+            {"gcp_project_id": "test-project", "location": "us-central1"}
+        ),
+        encoding="utf-8",
+    )
+
+    mock_gemini_inst = mock_gemini_cls.return_value
+    mock_gemini_inst.generate.return_value = "## SUMMARY\nAll good."
+
+    args = argparse.Namespace(
+        agent_dir=str(agent_dir),
+        project_id=None,
+        location=None,
+        model="gemini-3-flash-preview",
+        output=None,
+    )
+
+    with mock.patch("pathlib.Path.cwd", return_value=tmp_path):
+        llm_lint(args)
+
+    called_prompt = mock_gemini_inst.generate.call_args.kwargs["prompt"]
+    assert "--- BEGIN AGENT CONFIG CONTEXT ---" in called_prompt
+    assert "Declared Agent Tools: get_balance, end_session" in called_prompt
+    assert "Declared Child Agents: billing_agent" in called_prompt
+    assert (
+        "Declared App Variables: customer, customer.account_id, session_locale"
+        in called_prompt
+    )
