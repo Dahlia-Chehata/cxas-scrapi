@@ -532,7 +532,6 @@ cxas evals report \
     --runs 3 \
     --min-run-passes 2 \
     --min-pass-rate 0.85 \
-    --infra-retries 2 \
     --use-tool-fakes
 ```
 
@@ -545,8 +544,8 @@ For multi-run and audio simulation suites, you can combine automatic infrastruct
 | `--runs` | `1` | Number of runs per simulation test case |
 | `--min-run-passes` | `None` | Minimum passing runs (`k` of `N`) required for a test case to pass (defaults to `1` when unset) |
 | `--min-pass-rate` | `None` | Minimum fraction of cases (`0.0`–`1.0`) that must pass; exits `1` if below threshold or if `0` cases ran |
-| `--infra-retries` | `0` | Automatic retries for runs that fail due to a session exception, empty judge verdict, or (in `audio` modality) a silent WebSocket turn drop where the caller's last utterance never reached CES |
-| `--retry-parallel` | `None` | Worker concurrency during retry waves (defaults to `--sim-parallel` when `None`) |
+| `--infra-retries` | `2` | Automatic retries for runs that fail due to a session exception, empty judge verdict, or (in `audio` modality) a silent WebSocket turn drop where the caller's last utterance never reached CES (set to `0` to disable) |
+| `--retry-parallel` | `max(1, sim_parallel // 2)` | Worker concurrency during retry waves (steps down to half of `--sim-parallel` by default) |
 | `--retry-cooldown` | `60.0` | Cooldown in seconds before each retry wave |
 
 ---

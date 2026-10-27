@@ -186,8 +186,8 @@ The `cxas evals report` command runs evaluations across multiple types (simulati
 | `--use-tool-fakes` | `False` | Enable tool fakes (bypass real tool backends) |
 | `--min-run-passes` | `None` | Minimum passing runs per case for `k-of-N` majority voting (e.g., `2` with `--runs 3`) |
 | `--min-pass-rate` | `None` | Minimum fraction of cases (`0.0`–`1.0`) that must pass; exits `1` if below threshold or if `0` cases ran |
-| `--infra-retries` | `0` | Automatic retries for simulations that fail due to infrastructure errors or inconclusive/dropped audio turns |
-| `--retry-parallel` | `None` | Worker parallelism during simulation retry waves |
+| `--infra-retries` | `2` | Automatic retries for simulations that fail due to infrastructure errors or inconclusive/dropped audio turns (set to `0` to disable) |
+| `--retry-parallel` | `max(1, sim_parallel // 2)` | Worker parallelism during simulation retry waves |
 | `--retry-cooldown` | `60.0` | Cooldown in seconds before each simulation retry wave |
 | `--golden-run-method` | `STABLE` | Replay method for golden evaluations (`STABLE` or `NAIVE`) |
 | `--gcs-bundle-uri` | `None` | GCS prefix (`gs://bucket/path`) to upload `report.html`, raw JSON/YAML artifacts, `EVAL_STAMP-<suite>.txt`, and `latest-<suite>.html` |
@@ -211,9 +211,6 @@ cxas evals report \
   --runs 3 \
   --min-run-passes 2 \
   --min-pass-rate 0.85 \
-  --infra-retries 2 \
-  --retry-parallel 3 \
-  --retry-cooldown 60 \
   --sim-parallel 6 \
   --single-bidi-stream \
   --skip-playback-wait \
@@ -226,7 +223,7 @@ cxas evals report \
 What this enables automatically:
 1. **`k-of-N` Majority Voting (`--runs 3 --min-run-passes 2`)**: Groups runs by evaluation name and marks a case as passed when at least `k` of `N` runs pass.
 2. **Fail-Closed Pass-Rate Gate (`--min-pass-rate 0.85`)**: Exits with code `1` if the reconciled case pass rate falls below `85%` or if `0` evaluations ran (preventing typoed `--filter-tags` or `--filter-names` from silently passing CI).
-3. **Infrastructure & Dropped-Turn Retries (`--infra-retries 2`)**: Automatically retries simulation runs that encounter session errors, empty judge verdicts, or silent WebSocket caller-turn drops on audio sessions.
+3. **Automatic Infrastructure & Dropped-Turn Retries (defaults: `--infra-retries 2`, `--retry-cooldown 60`, `--retry-parallel max(1, sim_parallel // 2)`)**: Enabled out of the box — automatically retries simulation runs that encounter session errors, empty judge verdicts, or silent WebSocket caller-turn drops on audio sessions while stepping concurrency down by half during retry waves. Override with `--infra-retries N` (or `--infra-retries 0` to disable).
 4. **GCS Report Bundle & `latest-<suite>.html` Pointer (`--gcs-bundle-uri` & `--suite-name`)**: Uploads `report.html`, `sim_results.json`, `ces_results.json`, `sim_cases.yaml`, `EVAL_STAMP-<suite>.txt`, and a cache-busted (`Cache-Control: no-cache, max-age=0`) `latest-<suite>.html` pointer.
 5. **GitHub Actions Step Summary (`--github-step-summary`, default: `False`)**: In GitHub Actions, the runner sets the `$GITHUB_STEP_SUMMARY` environment variable to a file path whose Markdown contents are rendered directly on the workflow run's **Summary** page in the GitHub UI. When `--github-step-summary` is passed, SCRAPI appends a Markdown section containing the suite title, overall `X / Y cases passed (k-of-N pass rule)` headline, clickable `[Open HTML Report]` / `[Latest for branch]` GCS links (when `--gcs-bundle-uri` is set), and a per-case `Status | Case | Runs Passed` table. When `$GITHUB_STEP_SUMMARY` is unset (e.g., local runs), this flag is a safe no-op.
 

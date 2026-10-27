@@ -5430,7 +5430,7 @@ def generate_combined_report_from_dir(
     vertex_location: str = "global",
     naturalness: bool | dict[str, Any] | None = None,
     audio_analysis: bool | None = None,
-    infra_retries: int = 0,
+    infra_retries: int = 2,
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
     golden_run_method: str = "STABLE",
@@ -5497,7 +5497,7 @@ def generate_combined_report_from_dir(
 
     if run:
         extra_run_kwargs: dict[str, Any] = {}
-        if infra_retries:
+        if infra_retries != 2:
             extra_run_kwargs["infra_retries"] = infra_retries
         if retry_parallel is not None:
             extra_run_kwargs["retry_parallel"] = retry_parallel
@@ -5810,7 +5810,7 @@ def run_all_evals(
     vertex_location: str = "global",
     naturalness: bool | dict[str, Any] | None = None,
     audio_analysis: bool = False,
-    infra_retries: int = 0,
+    infra_retries: int = 2,
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
     golden_run_method: str = "STABLE",
@@ -5853,7 +5853,7 @@ def run_all_evals(
       'callback'.
     """
     extra_kwargs: dict[str, Any] = {}
-    if infra_retries:
+    if infra_retries != 2:
         extra_kwargs["infra_retries"] = infra_retries
     if retry_parallel is not None:
         extra_kwargs["retry_parallel"] = retry_parallel

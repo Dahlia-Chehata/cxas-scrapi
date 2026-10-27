@@ -676,7 +676,7 @@ def combined_evals_report_cmd(args: argparse.Namespace) -> None:
     extra_report_kwargs = {}
     if getattr(args, "audio_analysis", None) is not None:
         extra_report_kwargs["audio_analysis"] = args.audio_analysis
-    if getattr(args, "infra_retries", 0):
+    if getattr(args, "infra_retries", 2) != 2:
         extra_report_kwargs["infra_retries"] = args.infra_retries
     if getattr(args, "retry_parallel", None) is not None:
         extra_report_kwargs["retry_parallel"] = args.retry_parallel
@@ -2024,14 +2024,20 @@ def get_parser() -> argparse.ArgumentParser:
     parser_report.add_argument(
         "--infra-retries",
         type=int,
-        default=0,
-        help="Number of automatic retries for simulations that fail due to infrastructure or inconclusive turns.",
+        default=2,
+        help=(
+            "Number of automatic retries for simulations that fail due to "
+            "infrastructure or inconclusive turns. Defaults to 2 (set to 0 to disable)."
+        ),
     )
     parser_report.add_argument(
         "--retry-parallel",
         type=int,
         default=None,
-        help="Worker parallelism during simulation retry waves.",
+        help=(
+            "Worker parallelism during simulation retry waves. "
+            "Defaults to max(1, sim_parallel // 2)."
+        ),
     )
     parser_report.add_argument(
         "--retry-cooldown",

@@ -44,7 +44,6 @@ cxas evals report \
   --runs 3 \
   --min-run-passes 2 \
   --min-pass-rate 0.85 \
-  --infra-retries 2 \
   --suite-name sims-audio \
   --gcs-bundle-uri "gs://my-bucket/evals/main/run-1" \
   --github-step-summary \

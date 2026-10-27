@@ -1907,7 +1907,7 @@ class SimulationEvals(Apps):
         progress_callback: Callable[[int, int], None] | None = None,
         naturalness: bool | dict[str, Any] | None = None,
         audio_analysis: bool | None = None,
-        infra_retries: int = 0,
+        infra_retries: int = 2,
         retry_parallel: int | None = None,
         retry_cooldown: float = 60.0,
     ) -> list[dict[str, Any]]:
@@ -2009,7 +2009,9 @@ class SimulationEvals(Apps):
             effective_retry_parallel = max(
                 1,
                 min(
-                    retry_parallel if retry_parallel is not None else parallel,
+                    retry_parallel
+                    if retry_parallel is not None
+                    else max(1, parallel // 2),
                     len(retry_jobs),
                 ),
             )

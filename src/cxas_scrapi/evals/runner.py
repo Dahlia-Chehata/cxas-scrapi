@@ -79,7 +79,7 @@ def run_all_evals(
     vertex_location: str = "global",
     naturalness: bool | dict[str, typing.Any] | None = None,
     audio_analysis: bool = False,
-    infra_retries: int = 0,
+    infra_retries: int = 2,
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
     golden_run_method: str = "STABLE",
@@ -311,7 +311,7 @@ def run_all_evals(
                         f"{len(sim_files)} files"
                     )
                     sim_kwargs: dict[str, typing.Any] = {}
-                    if infra_retries:
+                    if infra_retries != 2:
                         sim_kwargs["infra_retries"] = infra_retries
                     if retry_parallel is not None:
                         sim_kwargs["retry_parallel"] = retry_parallel
