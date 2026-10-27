@@ -148,6 +148,7 @@ audio:
   uri_pattern: "{bucket}/{conversation_id}.wav"
   download_dir: ./.cxas/audio
   mime_type: audio/wav
+  questions_file: null             # optional path to a JSON/YAML scorecard template with custom audio questions
 
 cloud_logging:
   default_level: WARNING
@@ -160,15 +161,21 @@ cloud_logging:
 
 gemini:
   model: gemini-2.5-flash
-  # Audio analyses come from `cxas_scrapi.utils.audio_analysis.ANALYSIS_REGISTRY`
+  # Built-in audio analyses are loaded from
+  # `cxas_scrapi/utils/tracing/audio_analysis_questions.json`
   # (5 built-ins: agent_voice_consistency, no_long_pauses,
-  # agent_having_trouble, agent_looping, agent_cutoff). Each declares which
-  # files it needs (e.g. `agent-turn-*.wav` vs `full-session.wav`) and a
-  # default prompt. Override a prompt per-project by listing the metric here:
+  # agent_having_trouble, agent_looping, agent_cutoff). Override a built-in
+  # question or define new custom questions using `prompt` or scorecard
+  # question fields (`questionBody`, `answerInstructions`, `answerChoices`,
+  # `fileFilter`):
   audio_metrics: {}
-  # Example override:
+  # Examples:
   #   agent_cutoff:
   #     prompt: "Custom cutoff prompt for our agent..."
+  #   background_noise_check:
+  #     questionBody: "Determine if loud background noise is present."
+  #     answerInstructions: "Check user turn recordings for background noise."
+  #     fileFilter: "user-turn"
   triage_metrics:
     hallucination:        { prompt: "..." }
     off_topic:            { prompt: "..." }
