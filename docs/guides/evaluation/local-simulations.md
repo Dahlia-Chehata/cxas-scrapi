@@ -529,8 +529,21 @@ cxas evals report \
     --app-name "projects/my-project/locations/us/apps/my-app" \
     --output-dir "eval-reports" \
     --sim-parallel 5 \
+    --runs 3 \
+    --min-run-passes 2 \
+    --min-pass-rate 0.85 \
+    --infra-retries 2 \
     --use-tool-fakes
 ```
+
+### Infrastructure Retries & `k-of-N` Majority Voting
+
+For multi-run and audio simulation suites, you can combine automatic infrastructure retries with `k-of-N` majority voting:
+
+- **`--infra-retries N`**: Retries any simulation run that fails due to a session exception, empty judge verdict, or (in `audio` modality) a silent WebSocket turn drop where the caller's last utterance never reached CES.
+- **`--retry-parallel` & `--retry-cooldown`**: Controls worker concurrency and cooldown seconds between retry waves.
+- **`--runs N --min-run-passes K`**: Marks a simulation case as passing when at least `K` out of `N` runs pass.
+- **`--min-pass-rate R`**: Enforces a minimum case pass rate (`0.0`–`1.0`) and fails closed if `0` cases match your filters.
 
 ---
 

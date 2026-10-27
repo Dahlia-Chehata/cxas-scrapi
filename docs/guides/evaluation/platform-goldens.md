@@ -155,15 +155,25 @@ conversations:
 
 ## Pushing goldens to the platform
 
-Before you can run goldens, you need to push them to the platform:
+Before you can run goldens, you need to push them to the platform. `--file` accepts either a single YAML file or a directory of YAML files:
 
 ```bash
+# Push a single file
 cxas push-eval \
   --app-name "projects/my-project/locations/us/apps/my-app" \
   --file evals/goldens/order_lookup.yaml
+
+# Sync an entire directory and prune removed evaluations carrying a specific tag
+cxas push-eval \
+  --app-name "projects/my-project/locations/us/apps/my-app" \
+  --file evals/goldens/ \
+  --prune-tag regression
 ```
 
-Push each golden file individually using `--file`.
+When syncing evaluations:
+- Tool `displayName` references in `toolCall` / `toolResponse` expectations are automatically resolved to the target app's server-minted tool resource IDs.
+- If the platform returns `501 Not Implemented` on `UpdateEvaluation`, SCRAPI automatically falls back to `delete` + `create`.
+- `--prune` (or `--prune-tag <tag>`) deletes remote evaluations that are no longer present in your local YAML files, and `--dry-run` previews the changes without mutating the app.
 
 ---
 
@@ -186,7 +196,11 @@ You can filter which conversations to run using tags:
 ```bash
 cxas run \
   --app-name "projects/my-project/locations/us/apps/my-app" \
-  --filter-auto-metrics \
+  --tags P0 order_management \
+  --runs 3 \
+  --min-run-passes 2 \
+  --min-pass-rate 0.90 \
+  --golden-run-method NAIVE \
   --wait
 ```
 
