@@ -59,6 +59,23 @@ def _load_json_or_yaml(directory: Path, file_name: str) -> dict:
         )
 
 
+_NON_PATH_KEYS: frozenset[str] = frozenset(
+    {
+        "default",
+        "description",
+        "displayName",
+        "display_name",
+        "name",
+        "prompt",
+        "text",
+        "variableDeclarations",
+        "variable_declarations",
+        "variableOverrides",
+        "variable_overrides",
+    }
+)
+
+
 def _resolve_paths(
     data: typing.Any,
     extra_prefixes: typing.Any = (),
@@ -67,15 +84,22 @@ def _resolve_paths(
     """Recursively replace file-path strings with their contents."""
     if isinstance(data, dict):
         return {
-            k: _resolve_paths(v, extra_prefixes, base_path)
+            k: (
+                v
+                if k in _NON_PATH_KEYS
+                else _resolve_paths(v, extra_prefixes, base_path)
+            )
             for k, v in data.items()
         }
     elif isinstance(data, list):
         return [
             _resolve_paths(item, extra_prefixes, base_path) for item in data
         ]
-    elif isinstance(data, str) and data.endswith(
-        (".txt", ".py", ".yaml", ".json")
+    elif (
+        isinstance(data, str)
+        and "://" not in data
+        and not any(c.isspace() for c in data)
+        and data.endswith((".txt", ".py", ".yaml", ".json"))
     ):
         path_to_check = Path(data)
         resolved = False
@@ -121,22 +145,41 @@ def _get_required_fields(cls) -> list[str]:  # noqa: ANN001
         return []
     lines = doc.split("\n")
     required = []
+    cls_name = getattr(cls, "__name__", "")
     for i, line in enumerate(lines):
         match = re.match(r"^\s+(\w+)\s+\([^)]+\):$", line)
         if match and i + 1 < len(lines):  # noqa: SIM102
             if lines[i + 1].strip().startswith("Required."):
-                required.append(match.group(1))
+                field_name = match.group(1)
+                if (
+                    cls_name == "VariableDeclaration"
+                    and field_name == "description"
+                ):
+                    continue
+                if cls_name == "LlmPolicy" and field_name == "policy_scope":
+                    continue
+                required.append(field_name)
     return required
 
 
 def _validate_fields(data: dict, cls, path: str = "") -> None:  # noqa: ANN001
     """Validate required fields and recurse into nested proto messages."""
     required = _get_required_fields(cls)
+    cls_name = getattr(cls, "__name__", str(cls))
+    if cls_name == "Scenario" and any(
+        k in data
+        for k in (
+            "evaluationExpectations",
+            "evaluation_expectations",
+        )
+    ):
+        required = [
+            f for f in required if f not in ("rubrics", "scenario_expectations")
+        ]
     missing = [
         f for f in required if f not in data and _to_camel_case(f) not in data
     ]
     if missing:
-        cls_name = getattr(cls, "__name__", str(cls))
         raise ValueError(
             f"Missing required fields for {path} {cls_name}: {missing}"
         )
@@ -146,17 +189,18 @@ def _validate_fields(data: dict, cls, path: str = "") -> None:  # noqa: ANN001
             if not (hasattr(field, "message") and field.message is not None):
                 continue
             camel_name = _to_camel_case(name)
-            field_data = data.get(name) or data.get(camel_name)
-            if field_data is None:
+            field_data = data[name] if name in data else data.get(camel_name)
+            if not field_data:
                 continue
+            sub_path = f"{path}.{name}" if path else name
             if isinstance(field, proto.fields.RepeatedField):
                 for item in field_data if isinstance(field_data, list) else []:
-                    if isinstance(item, dict):
-                        _validate_fields(item, field.message)
+                    if isinstance(item, dict) and item:
+                        _validate_fields(item, field.message, path=sub_path)
             elif isinstance(field, proto.fields.Field) and isinstance(
                 field_data, dict
             ):
-                _validate_fields(field_data, field.message)
+                _validate_fields(field_data, field.message, path=sub_path)
 
 
 # ── Schema validation rule ───────────────────────────────────────────────
