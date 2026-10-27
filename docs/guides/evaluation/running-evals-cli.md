@@ -228,7 +228,7 @@ What this enables automatically:
 2. **Fail-Closed Pass-Rate Gate (`--min-pass-rate 0.85`)**: Exits with code `1` if the reconciled case pass rate falls below `85%` or if `0` evaluations ran (preventing typoed `--filter-tags` or `--filter-names` from silently passing CI).
 3. **Infrastructure & Dropped-Turn Retries (`--infra-retries 2`)**: Automatically retries simulation runs that encounter session errors, empty judge verdicts, or silent WebSocket caller-turn drops on audio sessions.
 4. **GCS Report Bundle & `latest-<suite>.html` Pointer (`--gcs-bundle-uri` & `--suite-name`)**: Uploads `report.html`, `sim_results.json`, `ces_results.json`, `sim_cases.yaml`, `EVAL_STAMP-<suite>.txt`, and a cache-busted (`Cache-Control: no-cache, max-age=0`) `latest-<suite>.html` pointer.
-5. **GitHub Actions Step Summary (`--github-step-summary`)**: Appends a Markdown pass/fail table and authenticated GCS report links to `$GITHUB_STEP_SUMMARY`.
+5. **GitHub Actions Step Summary (`--github-step-summary`, default: `False`)**: In GitHub Actions, the runner sets the `$GITHUB_STEP_SUMMARY` environment variable to a file path whose Markdown contents are rendered directly on the workflow run's **Summary** page in the GitHub UI. When `--github-step-summary` is passed, SCRAPI appends a Markdown section containing the suite title, overall `X / Y cases passed (k-of-N pass rule)` headline, clickable `[Open HTML Report]` / `[Latest for branch]` GCS links (when `--gcs-bundle-uri` is set), and a per-case `Status | Case | Runs Passed` table. When `$GITHUB_STEP_SUMMARY` is unset (e.g., local runs), this flag is a safe no-op.
 
 ---
 

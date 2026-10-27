@@ -540,10 +540,14 @@ cxas evals report \
 
 For multi-run and audio simulation suites, you can combine automatic infrastructure retries with `k-of-N` majority voting:
 
-- **`--infra-retries N`**: Retries any simulation run that fails due to a session exception, empty judge verdict, or (in `audio` modality) a silent WebSocket turn drop where the caller's last utterance never reached CES.
-- **`--retry-parallel` & `--retry-cooldown`**: Controls worker concurrency and cooldown seconds between retry waves.
-- **`--runs N --min-run-passes K`**: Marks a simulation case as passing when at least `K` out of `N` runs pass.
-- **`--min-pass-rate R`**: Enforces a minimum case pass rate (`0.0`–`1.0`) and fails closed if `0` cases match your filters.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--runs` | `1` | Number of runs per simulation test case |
+| `--min-run-passes` | `None` | Minimum passing runs (`k` of `N`) required for a test case to pass (defaults to `1` when unset) |
+| `--min-pass-rate` | `None` | Minimum fraction of cases (`0.0`–`1.0`) that must pass; exits `1` if below threshold or if `0` cases ran |
+| `--infra-retries` | `0` | Automatic retries for runs that fail due to a session exception, empty judge verdict, or (in `audio` modality) a silent WebSocket turn drop where the caller's last utterance never reached CES |
+| `--retry-parallel` | `None` | Worker concurrency during retry waves (defaults to `--sim-parallel` when `None`) |
+| `--retry-cooldown` | `60.0` | Cooldown in seconds before each retry wave |
 
 ---
 
