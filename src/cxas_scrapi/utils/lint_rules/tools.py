@@ -268,7 +268,8 @@ class HighCardinalityArgs(Rule):
     ) -> list[LintResult]:
         if file_path.suffix != ".py":
             return []
-        fn_match = FUNC_DEF_RE.search(content)
+        tool_dir_name = file_path.parent.parent.name
+        fn_match = _find_tool_function(content, tool_dir_name)
         if not fn_match:
             return []
 

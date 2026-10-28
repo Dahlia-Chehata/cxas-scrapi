@@ -64,7 +64,10 @@ def _get_args(content: str, fn_name: str) -> list[str] | None:
     except SyntaxError:
         return None
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == fn_name
+        ):
             return [arg.arg for arg in node.args.args]
     return None
 
@@ -186,7 +189,9 @@ class CamelCaseFunction(Rule):
         return results
 
 
-def _function_returns_dict(fn_node: ast.FunctionDef) -> bool:
+def _function_returns_dict(
+    fn_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
     """Return True if fn_node directly returns a dict literal."""
     stack = list(fn_node.body)
     while stack:
@@ -225,7 +230,11 @@ class ReturnsDictNotLlmResponse(Rule):
         try:
             tree = ast.parse(content)
             expected_fn, _ = CALLBACK_SIGNATURES.get(cb_type, (None, None))
-            top_fns = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+            top_fns = [
+                n
+                for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
             target_fns = [n for n in top_fns if n.name == expected_fn]
             if not target_fns:
                 target_fns = [n for n in top_fns if not n.name.startswith("_")]

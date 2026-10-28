@@ -25,6 +25,7 @@ from cxas_scrapi.utils.lint_rules.callbacks import (
 from cxas_scrapi.utils.lint_rules.tools import (
     CompositeToolConversationalPacing,
     FunctionNameMismatch,
+    HighCardinalityArgs,
     KwargsInSignature,
     MissingToolDescriptionInJSON,
     MissingTypeHints,
@@ -177,3 +178,37 @@ def test_t011_parses_complex_type_annotations_with_commas_via_ast(
     assert len(results) == 2  # noqa: PLR2004
     assert "Parameter 'customized_response'" in results[0].message
     assert "Parameter 'active_lookup_flows'" in results[1].message
+
+
+def test_t005_skips_private_helper_functions_above_tool_def(
+    tmp_path: Path, context: LintContext
+) -> None:
+    tool_dir = tmp_path / "tools" / "lookup_order" / "python_function"
+    tool_dir.mkdir(parents=True)
+    f = tool_dir / "python_code.py"
+    f.write_text(
+        "def _format_ts(timestamp: str) -> str:\n"
+        "    return timestamp\n\n"
+        "def lookup_order(order_id: str = '') -> dict:\n"
+        "    return {'ts': _format_ts('now')}\n"
+    )
+
+    assert HighCardinalityArgs().check(f, f.read_text(), context) == []
+
+
+def test_c004_handles_async_callback_functions(
+    tmp_path: Path, context: LintContext
+) -> None:
+    cb_dir = (
+        tmp_path / "agents" / "root" / "before_model_callbacks" / "async_01"
+    )
+    cb_dir.mkdir(parents=True)
+    f = cb_dir / "python_code.py"
+    f.write_text(
+        "async def before_model_callback(callback_context, llm_request):\n"
+        "    return {'bad': 'dict'}\n"
+    )
+
+    results = ReturnsDictNotLlmResponse().check(f, f.read_text(), context)
+    assert len(results) == 1
+    assert results[0].rule_id == "C004"
