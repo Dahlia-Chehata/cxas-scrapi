@@ -20,7 +20,11 @@ import typing
 from pathlib import Path
 from unittest import mock
 
-from cxas_scrapi.cli.llm_lint import llm_lint, resolve_gcp_credentials
+from cxas_scrapi.cli.llm_lint import (
+    build_agent_config_context,
+    llm_lint,
+    resolve_gcp_credentials,
+)
 from cxas_scrapi.prompts import LLM_LINT_SYSTEM_PROMPT, LLM_LINT_USER_PROMPT
 
 
@@ -590,8 +594,6 @@ def test_build_agent_config_context_resolves_child_display_name_and_deep_yaml_va
     tmp_path: typing.Any,
 ) -> None:
     """Includes child displayName, deep nested properties, and app.yaml vars."""
-    from cxas_scrapi.cli.llm_lint import build_agent_config_context  # noqa: PLC0415
-
     root_dir = tmp_path / "agents" / "root_agent"
     root_dir.mkdir(parents=True)
     (root_dir / "root_agent.json").write_text(
