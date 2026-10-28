@@ -64,7 +64,10 @@ def _get_args(content: str, fn_name: str) -> list[str] | None:
     except SyntaxError:
         return None
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == fn_name
+        ):
             return [arg.arg for arg in node.args.args]
     return None
 
@@ -186,6 +189,27 @@ class CamelCaseFunction(Rule):
         return results
 
 
+def _function_returns_dict(
+    fn_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> bool:
+    """Return True if fn_node directly returns a dict literal."""
+    stack = list(fn_node.body)
+    while stack:
+        stmt = stack.pop()
+        if isinstance(
+            stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue
+        if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Dict):
+            return True
+        for child in ast.iter_child_nodes(stmt):
+            if not isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                stack.append(child)
+    return False
+
+
 @rule("callbacks")
 class ReturnsDictNotLlmResponse(Rule):
     id = "C004"
@@ -202,7 +226,25 @@ class ReturnsDictNotLlmResponse(Rule):
         if cb_type not in ("before_model_callbacks", "after_model_callbacks"):
             return []
 
-        if "return {" in content and "LlmResponse" not in content:
+        returns_dict = False
+        try:
+            tree = ast.parse(content)
+            expected_fn, _ = CALLBACK_SIGNATURES.get(cb_type, (None, None))
+            top_fns = [
+                n
+                for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            target_fns = [n for n in top_fns if n.name == expected_fn]
+            if not target_fns:
+                target_fns = [n for n in top_fns if not n.name.startswith("_")]
+            returns_dict = any(_function_returns_dict(fn) for fn in target_fns)
+        except SyntaxError:
+            returns_dict = (
+                "return {" in content and "LlmResponse" not in content
+            )
+
+        if returns_dict:
             return [
                 self.make_result(
                     file=rel,
@@ -316,6 +358,26 @@ class BareExcept(Rule):
         return results
 
 
+_PYTHON_COLLECTION_METHODS: frozenset[str] = frozenset(
+    {
+        "add",
+        "append",
+        "clear",
+        "copy",
+        "discard",
+        "extend",
+        "get",
+        "items",
+        "keys",
+        "pop",
+        "remove",
+        "setdefault",
+        "update",
+        "values",
+    }
+)
+
+
 @rule("callbacks")
 class ToolNamingConvention(Rule):
     id = "C007"
@@ -328,8 +390,10 @@ class ToolNamingConvention(Rule):
     ) -> list[LintResult]:
         rel = str(file_path.relative_to(context.project_root))
         results = []
-        tool_calls = re.findall(r"tools\.(\w+)\s*\(", content)
+        tool_calls = re.findall(r"\btools\.(\w+)\s*\(", content)
         for tool_name in tool_calls:
+            if tool_name in _PYTHON_COLLECTION_METHODS:
+                continue
             if tool_name not in context.all_known_tools:
                 results.append(
                     self.make_result(
