@@ -20,6 +20,8 @@ import os
 import sys
 from pathlib import Path
 
+import yaml
+
 from cxas_scrapi.prompts import LLM_LINT_SYSTEM_PROMPT, LLM_LINT_USER_PROMPT
 from cxas_scrapi.utils.gemini import GeminiGenerate
 
@@ -94,62 +96,132 @@ def extract_dynamic_instructions(file_path: Path) -> dict[str, str]:
     return dynamic_instructions
 
 
+def _load_structured_file(path: Path) -> dict | None:
+    """Load a JSON or YAML file as a dictionary, or return None on error."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = (
+            yaml.safe_load(raw)
+            if path.suffix in (".yaml", ".yml")
+            else json.loads(raw)
+        )
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, yaml.YAMLError, OSError):
+        return None
+
+
+def _resolve_child_agent_label(agents_dir: Path, child_ref: str) -> str:
+    """Return child agent identifier with its displayName when it differs."""
+    candidates = [agents_dir / child_ref]
+    normalized = child_ref.replace(" ", "_")
+    if normalized != child_ref:
+        candidates.append(agents_dir / normalized)
+
+    for child_dir in candidates:
+        for ext in (".json", ".yaml"):
+            cfg_path = child_dir / f"{child_dir.name}{ext}"
+            if not cfg_path.exists():
+                continue
+            cfg = _load_structured_file(cfg_path)
+            if not cfg:
+                continue
+            display_name = cfg.get("displayName") or cfg.get("display_name")
+            if (
+                isinstance(display_name, str)
+                and display_name
+                and display_name != child_ref
+            ):
+                return f'{child_ref} (displayName: "{display_name}")'
+            return child_ref
+    return child_ref
+
+
+def _collect_schema_paths(prefix: str, schema: object, out: list[str]) -> None:
+    """Recursively append dotted property paths from a JSON/CES schema dict."""
+    if not isinstance(schema, dict):
+        return
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return
+    for prop in sorted(props):
+        full_path = f"{prefix}.{prop}"
+        out.append(full_path)
+        _collect_schema_paths(full_path, props[prop], out)
+
+
 def build_agent_config_context(agent_dir: Path) -> str:
     """Builds a summary of declared tools, child agents, and app variables.
 
-    Reads ``<agent_dir>/<agent_dir.name>.json`` for ``tools`` and
-    ``childAgents``, and walks up to ``app.json`` for
+    Reads ``<agent_dir>/<agent_dir.name>.json`` (or ``.yaml``) for ``tools``
+    and ``childAgents``, and walks up to ``app.json`` / ``app.yaml`` for
     ``variableDeclarations``. Returns an empty string when no config files
     exist so callers without config files keep the exact base prompt.
     """
     context_lines: list[str] = []
 
-    agent_json = agent_dir / f"{agent_dir.name}.json"
-    if agent_json.exists():
-        try:
-            agent_data = json.loads(agent_json.read_text(encoding="utf-8"))
-            if isinstance(agent_data, dict):
-                tools = agent_data.get("tools")
-                if isinstance(tools, list):
-                    context_lines.append(
-                        f"Declared Agent Tools: {', '.join(map(str, tools)) or '(none)'}"
-                    )
-                child_agents = agent_data.get("childAgents")
-                if isinstance(child_agents, list):
-                    context_lines.append(
-                        f"Declared Child Agents: {', '.join(map(str, child_agents)) or '(none)'}"
-                    )
-        except (json.JSONDecodeError, OSError):
-            pass
+    agent_cfg_path = next(
+        (
+            p
+            for ext in (".json", ".yaml")
+            if (p := agent_dir / f"{agent_dir.name}{ext}").exists()
+        ),
+        None,
+    )
+    if agent_cfg_path is not None:
+        agent_data = _load_structured_file(agent_cfg_path)
+        if agent_data is not None:
+            tools = agent_data.get("tools")
+            if isinstance(tools, list):
+                context_lines.append(
+                    f"Declared Agent Tools: {', '.join(map(str, tools)) or '(none)'}"
+                )
+            child_agents = (
+                agent_data.get("childAgents")
+                if "childAgents" in agent_data
+                else agent_data.get("child_agents")
+            )
+            if isinstance(child_agents, list):
+                labels = [
+                    _resolve_child_agent_label(agent_dir.parent, str(c))
+                    for c in child_agents
+                ]
+                context_lines.append(
+                    f"Declared Child Agents: {', '.join(labels) or '(none)'}"
+                )
 
     current_dir = agent_dir.resolve()
     while current_dir != current_dir.parent:
-        app_json = current_dir / "app.json"
-        if app_json.exists():
-            try:
-                app_data = json.loads(app_json.read_text(encoding="utf-8"))
-                if isinstance(app_data, dict):
-                    var_decls = app_data.get("variableDeclarations")
-                    if isinstance(var_decls, list):
-                        var_names: list[str] = []
-                        for decl in var_decls:
-                            if not isinstance(decl, dict):
-                                continue
-                            name = decl.get("name")
-                            if not isinstance(name, str) or not name:
-                                continue
-                            var_names.append(name)
-                            schema = decl.get("schema")
-                            if isinstance(schema, dict):
-                                props = schema.get("properties")
-                                if isinstance(props, dict):
-                                    for prop in sorted(props):
-                                        var_names.append(f"{name}.{prop}")
-                        context_lines.append(
-                            f"Declared App Variables: {', '.join(var_names) or '(none)'}"
+        app_cfg_path = next(
+            (
+                p
+                for name in ("app.json", "app.yaml")
+                if (p := current_dir / name).exists()
+            ),
+            None,
+        )
+        if app_cfg_path is not None:
+            app_data = _load_structured_file(app_cfg_path)
+            if app_data is not None:
+                var_decls = (
+                    app_data.get("variableDeclarations")
+                    if "variableDeclarations" in app_data
+                    else app_data.get("variable_declarations")
+                )
+                if isinstance(var_decls, list):
+                    var_names: list[str] = []
+                    for decl in var_decls:
+                        if not isinstance(decl, dict):
+                            continue
+                        name = decl.get("name")
+                        if not isinstance(name, str) or not name:
+                            continue
+                        var_names.append(name)
+                        _collect_schema_paths(
+                            name, decl.get("schema"), var_names
                         )
-            except (json.JSONDecodeError, OSError):
-                pass
+                    context_lines.append(
+                        f"Declared App Variables: {', '.join(var_names) or '(none)'}"
+                    )
             break
         current_dir = current_dir.parent
 

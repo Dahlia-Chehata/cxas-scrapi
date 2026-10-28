@@ -584,3 +584,61 @@ def test_llm_lint_includes_agent_and_app_config_context(
         "Declared App Variables: customer, customer.account_id, session_locale"
         in called_prompt
     )
+
+
+def test_build_agent_config_context_resolves_child_display_name_and_deep_yaml_vars(
+    tmp_path: typing.Any,
+) -> None:
+    """Includes child displayName, deep nested properties, and app.yaml vars."""
+    from cxas_scrapi.cli.llm_lint import build_agent_config_context  # noqa: PLC0415
+
+    root_dir = tmp_path / "agents" / "root_agent"
+    root_dir.mkdir(parents=True)
+    (root_dir / "root_agent.json").write_text(
+        json.dumps(
+            {
+                "displayName": "Root Agent",
+                "childAgents": ["billing_specialist", "tech_support"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    child_dir = tmp_path / "agents" / "billing_specialist"
+    child_dir.mkdir(parents=True)
+    (child_dir / "billing_specialist.json").write_text(
+        json.dumps({"displayName": "Billing Specialist"}),
+        encoding="utf-8",
+    )
+
+    tech_dir = tmp_path / "agents" / "tech_support"
+    tech_dir.mkdir(parents=True)
+    (tech_dir / "tech_support.json").write_text(
+        json.dumps({"displayName": "tech_support"}),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "app.yaml").write_text(
+        "name: test-app\n"
+        "variable_declarations:\n"
+        "  - name: customer\n"
+        "    schema:\n"
+        "      type: OBJECT\n"
+        "      properties:\n"
+        "        billing:\n"
+        "          type: OBJECT\n"
+        "          properties:\n"
+        "            address:\n"
+        "              type: STRING\n",
+        encoding="utf-8",
+    )
+
+    ctx = build_agent_config_context(root_dir)
+    assert (
+        'Declared Child Agents: billing_specialist (displayName: "Billing Specialist"), tech_support'
+        in ctx
+    )
+    assert (
+        "Declared App Variables: customer, customer.billing, customer.billing.address"
+        in ctx
+    )
