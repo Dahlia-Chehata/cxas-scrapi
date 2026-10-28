@@ -5440,6 +5440,7 @@ def generate_combined_report_from_dir(
     suite_name: str | None = None,
     github_step_summary: bool = False,
     return_gate_status: bool = False,
+    platform_sims: bool = False,
 ) -> str | tuple[str, dict[str, Any]]:
     """Load results from directory and generate a combined report.
 
@@ -5472,6 +5473,8 @@ def generate_combined_report_from_dir(
         True enables it with defaults, False disables it, and a dict is
         merged over each test case's own config. None (default) defers to
         the test case.
+      platform_sims: If True, executes platform-compatible simulation test
+        cases as CXAS 2.0 Milestone evaluations on the CES platform.
 
     Returns:
       The resolved output path or URL where the report was saved.
@@ -5536,6 +5539,7 @@ def generate_combined_report_from_dir(
             vertex_location=vertex_location,
             naturalness=naturalness,
             audio_analysis=bool(audio_analysis),
+            **({"platform_sims": True} if platform_sims else {}),
             **extra_run_kwargs,
         )
         sim_results = run_results["simulation"] if "sims" in include else []
@@ -5814,6 +5818,7 @@ def run_all_evals(
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
     golden_run_method: str = "STABLE",
+    platform_sims: bool = False,
 ) -> dict[str, Any]:
     """Runs all 4 types of evaluations and returns aggregated results.
 
@@ -5847,6 +5852,8 @@ def run_all_evals(
         True enables it with defaults, False disables it, and a dict is
         merged over each test case's own config. None (default) defers to
         the test case.
+      platform_sims: If True, executes platform-compatible simulation test
+        cases as CXAS 2.0 Milestone evaluations on the CES platform.
 
     Returns:
       A dict containing lists of results for 'simulation', 'golden', 'tool', and
@@ -5863,6 +5870,8 @@ def run_all_evals(
         extra_kwargs["audio_analysis"] = audio_analysis
     if golden_run_method != "STABLE":
         extra_kwargs["golden_run_method"] = golden_run_method
+    if platform_sims:
+        extra_kwargs["platform_sims"] = platform_sims
     return evals_runner.run_all_evals(
         app_name=app_name,
         modality=modality,

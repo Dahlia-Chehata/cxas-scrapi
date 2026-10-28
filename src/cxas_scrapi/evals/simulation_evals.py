@@ -602,6 +602,374 @@ class SimulationEvals(Apps):
             credentials=self.creds,
         )
 
+    @staticmethod
+    def requires_local_execution(
+        test_case: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Checks if a test case requires local execution (cannot be run as a
+        platform Milestone eval).
+
+        Returns:
+            (requires_local: bool, reason: str)
+        """
+        if test_case.get("modality") == "audio":
+            return True, "Audio modality requires local client simulation"
+        if test_case.get("audio_expectations"):
+            return True, "audio_expectations requires local client simulation"
+        if test_case.get("naturalness_metric") or test_case.get("naturalness"):
+            return True, "naturalness_metric requires local client evaluation"
+        if test_case.get("use_tool_fakes"):
+            return True, "use_tool_fakes requires local simulation session"
+        if test_case.get("barge_in_after_ms") is not None:
+            return True, "barge_in_after_ms requires local audio bidi session"
+        for step in test_case.get("steps", []):
+            if (
+                isinstance(step, dict)
+                and step.get("barge_in_after_ms") is not None
+            ):
+                return (
+                    True,
+                    "Step barge_in_after_ms requires local bidi session",
+                )
+        return False, ""
+
+    def to_milestone_yaml(
+        self, test_cases: list[dict[str, Any]] | dict[str, Any]
+    ) -> str:
+        """Converts simulation test case(s) into CES Platform Milestone YAML."""
+        from cxas_scrapi.utils.eval_utils import (  # noqa: PLC0415
+            EvalUtils,
+        )
+
+        return EvalUtils.convert_sim_evals_to_milestone_yaml(test_cases)
+
+    def push_to_platform(
+        self,
+        test_cases: list[dict[str, Any]] | dict[str, Any],
+        conflict_strategy: str = "OVERWRITE",
+    ) -> Any:
+        """Pushes simulation test case(s) to CES as Milestone evaluations."""
+        from cxas_scrapi.utils.eval_utils import (  # noqa: PLC0415
+            EvalUtils,
+        )
+
+        eval_utils = EvalUtils(app_name=self.app_name, creds=self.creds)
+        return eval_utils.push_milestone_evals_from_yaml(
+            source=test_cases,
+            app_name=self.app_name,
+            conflict_strategy=conflict_strategy,
+        )
+
+    def run_simulations_on_platform(
+        self,
+        test_cases: list[dict[str, Any]],
+        runs: int = 1,
+        timeout_seconds: int = 600,
+    ) -> list[dict[str, Any]]:
+        """Pushes and runs simulations on the CES platform via RunEvaluation,
+        returning results formatted as simulation result dictionaries.
+        """
+        from cxas_scrapi.core.evaluations import (  # noqa: PLC0415
+            Evaluations,
+        )
+        from cxas_scrapi.utils.eval_utils import (  # noqa: PLC0415
+            EvalUtils,
+        )
+
+        eval_client = Evaluations(app_name=self.app_name, creds=self.creds)
+        eval_utils = EvalUtils(app_name=self.app_name, creds=self.creds)
+
+        import_op = self.push_to_platform(test_cases)
+
+        eval_names: list[str] = []
+        if isinstance(import_op, dict):
+            imported_evals = import_op.get("response", {}).get(
+                "evaluations", []
+            )
+            if isinstance(imported_evals, list):
+                eval_names = [
+                    e["name"]
+                    for e in imported_evals
+                    if isinstance(e, dict) and "name" in e
+                ]
+
+        if not eval_names:
+            eval_names = [
+                tc["name"]
+                for tc in test_cases
+                if isinstance(tc, dict) and "name" in tc
+            ]
+        if not eval_names:
+            return []
+
+        try:
+            run_op = eval_client.run_evaluation(
+                evaluations=eval_names,
+                app_name=self.app_name,
+                modality="text",
+                run_count=runs,
+            )
+        except Exception:
+            resolved_names = []
+            evals_map = None
+            for e_name in eval_names:
+                if e_name.startswith("projects/") and "/evaluations/" in e_name:
+                    resolved_names.append(e_name)
+                else:
+                    if evals_map is None:
+                        evals_map = eval_client._get_or_load_evals_map(
+                            self.app_name
+                        )
+                    r_name = evals_map.get("scenarios", {}).get(
+                        e_name
+                    ) or evals_map.get("goldens", {}).get(e_name)
+                    if r_name:
+                        resolved_names.append(r_name)
+            run_op = eval_client.run_evaluation_rest(
+                evaluations=resolved_names or eval_names,
+                app_name=self.app_name,
+                modality="text",
+                run_count=runs,
+            )
+
+        meta_run = getattr(
+            getattr(run_op, "metadata", None), "evaluation_run", None
+        )
+        run_id = (
+            meta_run
+            if isinstance(meta_run, str) and meta_run
+            else getattr(run_op, "name", None)
+        )
+        if not isinstance(run_id, str) or not run_id:
+            run_id = None
+        if not run_id and hasattr(run_op, "operation"):
+            op_name_attr = getattr(run_op.operation, "name", None)
+            if isinstance(op_name_attr, str) and op_name_attr:
+                run_id = op_name_attr
+        if not run_id and isinstance(run_op, dict):
+            run_id = (
+                run_op.get("evaluationRun")
+                or run_op.get("metadata", {}).get("evaluationRun")
+                or run_op.get("response", {}).get("evaluationRun")
+                or run_op.get("name")
+            )
+
+        if (
+            run_id
+            and "/evaluationRuns/" not in run_id
+            and hasattr(run_op, "_refresh")
+        ):
+            from google.cloud.ces_v1beta.types import (  # noqa: PLC0415
+                RunEvaluationOperationMetadata,
+            )
+
+            for _ in range(12):
+                with contextlib.suppress(Exception):
+                    refreshed = run_op._refresh(None)
+                    meta = RunEvaluationOperationMetadata()
+                    meta._pb.ParseFromString(refreshed.metadata.value)
+                    if meta.evaluation_run:
+                        run_id = meta.evaluation_run
+                        break
+                time.sleep(5)
+
+        if (
+            run_id
+            and "/evaluationRuns/" not in run_id
+            and "/operations/" in run_id
+        ):
+            op_name = run_id
+            for _ in range(12):
+                with contextlib.suppress(Exception):
+                    op_state = eval_client.get_operation_rest(op_name)
+                    candidate = op_state.get("metadata", {}).get(
+                        "evaluationRun"
+                    ) or op_state.get("response", {}).get("evaluationRun")
+                    if candidate:
+                        run_id = candidate
+                        break
+                time.sleep(5)
+
+        raw_results = []
+        if run_id and "/evaluationRuns/" in run_id:
+            raw_results = eval_utils.wait_for_run_and_get_results(
+                run_id, timeout_seconds=timeout_seconds
+            )
+
+        df_dict = eval_utils.evals_to_dataframe(results=raw_results)
+        df_summary = df_dict.get("summary", pd.DataFrame())
+        df_metadata = df_dict.get("metadata", pd.DataFrame())
+        df_failures = df_dict.get("failures", pd.DataFrame())
+
+        sim_results: list[dict[str, Any]] = []
+        tc_map = {
+            tc.get("name"): tc for tc in test_cases if isinstance(tc, dict)
+        }
+
+        for tc_name, tc_def in tc_map.items():
+            tc_runs = (
+                df_summary[df_summary["display_name"] == tc_name]
+                if not df_summary.empty
+                else pd.DataFrame()
+            )
+            if tc_runs.empty:
+                sim_results.append(
+                    {
+                        "name": tc_name,
+                        "passed": False,
+                        "status": "FAIL",
+                        "goals": "0/0",
+                        "expectations": "0/0",
+                        "duration_s": 0.0,
+                        "run": 1,
+                        "runs": runs,
+                        "platform": True,
+                        "step_details": [],
+                        "expectation_details": [],
+                        "session_parameters": tc_def.get(
+                            "session_parameters", {}
+                        ),
+                    }
+                )
+                continue
+
+            tc_steps = (
+                tc_def.get("steps", [])
+                if isinstance(tc_def.get("steps"), list)
+                else []
+            )
+
+            for run_idx, (_, row) in enumerate(tc_runs.iterrows()):
+                res_id = row.get("eval_result_id", "")
+                res_meta = (
+                    df_metadata[df_metadata["eval_result_id"] == res_id]
+                    if not df_metadata.empty
+                    else pd.DataFrame()
+                )
+                res_fails = (
+                    df_failures[df_failures["eval_result_id"] == res_id]
+                    if not df_failures.empty
+                    else pd.DataFrame()
+                )
+
+                milestone_rows = (
+                    res_meta[res_meta["type"] == "Milestone"]
+                    if not res_meta.empty and "type" in res_meta.columns
+                    else pd.DataFrame()
+                )
+                exp_rows = (
+                    res_meta[res_meta["type"] == "Custom Expectation"]
+                    if not res_meta.empty and "type" in res_meta.columns
+                    else pd.DataFrame()
+                )
+
+                milestones_met = (
+                    sum(milestone_rows["outcome"] == "PASS")
+                    if not milestone_rows.empty
+                    else 0
+                )
+                total_milestones = len(milestone_rows)
+                exps_met = (
+                    sum(exp_rows["outcome"] == "PASS")
+                    if not exp_rows.empty
+                    else 0
+                )
+                total_exps = len(exp_rows)
+
+                step_details = []
+                for step_idx, (_, m_row) in enumerate(
+                    milestone_rows.iterrows()
+                ):
+                    raw_score = str(m_row.get("score", "")).upper()
+                    if (
+                        raw_score == "COMPLETED"
+                        or m_row.get("outcome") == "PASS"
+                    ):
+                        step_status = "Completed"
+                    elif raw_score == "IN_PROGRESS":
+                        step_status = "In Progress"
+                    else:
+                        step_status = "Not Started"
+                    criteria = str(m_row.get("success_criteria") or "")
+                    if (
+                        not criteria
+                        and step_idx < len(tc_steps)
+                        and isinstance(tc_steps[step_idx], dict)
+                    ):
+                        criteria = str(
+                            tc_steps[step_idx].get("success_criteria")
+                            or tc_steps[step_idx].get("successCriteria")
+                            or ""
+                        )
+                    step_details.append(
+                        {
+                            "goal": str(m_row.get("expected", "")),
+                            "success_criteria": criteria,
+                            "status": step_status,
+                            "justification": str(m_row.get("actual", "")),
+                        }
+                    )
+
+                expectation_details = []
+                for _, e_row in exp_rows.iterrows():
+                    expectation_details.append(
+                        {
+                            "expectation": str(e_row.get("expected", "")),
+                            "status": (
+                                "Met"
+                                if e_row.get("outcome") == "PASS"
+                                else "Not Met"
+                            ),
+                            "justification": str(e_row.get("actual", "")),
+                        }
+                    )
+
+                status_val = str(row.get("evaluation_status", "")).upper()
+                exec_state_val = str(row.get("execution_state", "")).upper()
+                passed = (
+                    status_val == "PASS"
+                    and exec_state_val not in ("ERROR", "ERRORED", "CANCELLED")
+                    and res_fails.empty
+                )
+                conv_name = str(row.get("conversation", ""))
+                sess_id = (
+                    conv_name.rsplit("/", 1)[-1]
+                    if "/" in conv_name
+                    else conv_name
+                )
+
+                result_entry: dict[str, Any] = {
+                    "name": tc_name,
+                    "passed": passed,
+                    "status": "PASS" if passed else "FAIL",
+                    "goals": f"{milestones_met}/{total_milestones}",
+                    "expectations": f"{exps_met}/{total_exps}",
+                    "duration_s": 0.0,
+                    "run": run_idx + 1,
+                    "runs": runs,
+                    "platform": True,
+                    "eval_result_id": res_id,
+                    "evaluation_run": str(
+                        row.get("evaluation_run", "") or run_id or ""
+                    ),
+                    "conversation_name": conv_name,
+                    "session_id": sess_id,
+                    "step_details": step_details,
+                    "expectation_details": expectation_details,
+                    "session_parameters": tc_def.get("session_parameters", {}),
+                }
+                if exec_state_val in (
+                    "ERROR",
+                    "ERRORED",
+                ) or status_val in ("ERROR", "ERRORED"):
+                    result_entry["error"] = str(
+                        row.get("error_message") or "Unknown Agent Exception"
+                    )
+
+                sim_results.append(result_entry)
+
+        return sim_results
+
     def _parse_agent_response(
         self, response: Any
     ) -> tuple[str, list[str], bool, list[Any]]:
@@ -1925,9 +2293,9 @@ class SimulationEvals(Apps):
         infra_retries: int = 2,
         retry_parallel: int | None = None,
         retry_cooldown: float = 60.0,
+        run_on_platform: bool = False,
+        platform_timeout: int = 600,
     ) -> list[dict[str, Any]]:
-        if expectations_only is not None:
-            self.expectations_only = expectations_only
         """Runs multiple simulations, optionally in parallel.
 
         Args:
@@ -1945,7 +2313,84 @@ class SimulationEvals(Apps):
                 `naturalness_metric` block.
             audio_analysis: Run multimodal audio checks, acoustic metrics,
                 and voice drift analysis. Defaults to instance setting.
+            run_on_platform: If True, executes platform-compatible cases via
+                CES Milestone evals.
+            platform_timeout: Max seconds to wait for platform evaluation run.
         """
+        if expectations_only is not None:
+            self.expectations_only = expectations_only
+        if run_on_platform:
+            platform_cases: list[dict[str, Any]] = []
+            local_cases: list[dict[str, Any]] = []
+            effective_naturalness = (
+                naturalness
+                if naturalness is not None
+                else getattr(self, "naturalness", False)
+            )
+            for tc in test_cases:
+                effective_tc = dict(tc) if isinstance(tc, dict) else {}
+                if (
+                    modality
+                    and modality.lower() != "text"
+                    and "modality" not in effective_tc
+                ):
+                    effective_tc["modality"] = modality
+                if use_tool_fakes and not effective_tc.get("use_tool_fakes"):
+                    effective_tc["use_tool_fakes"] = True
+                if effective_naturalness and not effective_tc.get(
+                    "naturalness_metric"
+                ):
+                    effective_tc["naturalness_metric"] = True
+                requires_local, reason = self.requires_local_execution(
+                    effective_tc
+                )
+                if requires_local:
+                    logger.info(
+                        "Test case '%s' routed to local simulation (%s)",
+                        tc.get("name", "unnamed"),
+                        reason,
+                    )
+                    local_cases.append(tc)
+                else:
+                    platform_cases.append(tc)
+
+            results: list[dict[str, Any]] = []
+            if platform_cases:
+                results.extend(
+                    self.run_simulations_on_platform(
+                        platform_cases,
+                        runs=runs,
+                        timeout_seconds=platform_timeout,
+                    )
+                )
+            if local_cases:
+                results.extend(
+                    self.run_simulations(
+                        test_cases=local_cases,
+                        runs=runs,
+                        parallel=parallel,
+                        sim_user_model=sim_user_model,
+                        eval_model=eval_model,
+                        modality=modality,
+                        verbose=verbose,
+                        capture_agent_audio=capture_agent_audio,
+                        background_noise_file=background_noise_file,
+                        burst_noise_files=burst_noise_files,
+                        use_tool_fakes=use_tool_fakes,
+                        expectations_only=expectations_only,
+                        skip_playback_wait=skip_playback_wait,
+                        single_bidi_stream=single_bidi_stream,
+                        progress_callback=progress_callback,
+                        naturalness=naturalness,
+                        audio_analysis=audio_analysis,
+                        infra_retries=infra_retries,
+                        retry_parallel=retry_parallel,
+                        retry_cooldown=retry_cooldown,
+                        run_on_platform=False,
+                    )
+                )
+            return results
+
         sim_user_model = sim_user_model or _DEFAULT_SIM_USER_MODEL
         eval_model = eval_model or _DEFAULT_EVAL_MODEL
         if naturalness is not None:

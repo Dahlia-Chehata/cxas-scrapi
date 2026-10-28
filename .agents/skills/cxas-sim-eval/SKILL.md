@@ -103,7 +103,7 @@ python .agents/skills/cxas-sim-eval/scripts/convert_eval.py \
   --parallelism 5
 ```
 
-### 4. Run Evaluations
+### 4. Run Evaluations (Local or Platform Milestone Evals)
 
 `scripts/run_evals.py`
 
@@ -112,7 +112,7 @@ Runs the simulation evaluations, logs raw results, and generates a combined HTML
 **Cognitive Diagnostics Analysis**:
 If the agent has the `intercept_and_score_reasoning` tool enabled, this script will automatically extract and analyze the agent's internal monologue for failed evaluations. It detects issues like overthinking, hesitation, and backtracking. Furthermore, it correlates these diagnostics with the agent's instructions to generate **actionable suggestions** for improvement directly in the HTML report.
 
-Usage:
+Usage (local execution):
 
 ```bash
 python .agents/skills/cxas-sim-eval/scripts/run_evals.py \
@@ -121,6 +121,22 @@ python .agents/skills/cxas-sim-eval/scripts/run_evals.py \
   --parallelism 5 \
   --start-index 0 \
   --end-index 10
+```
+
+Usage (CXAS 2.0 Platform Milestone execution via CLI or SDK):
+
+```bash
+# Push converted sim_evals directly to the CES platform as Milestone evaluations
+uv run cxas push-eval \
+  --app-name "projects/.../locations/.../apps/..." \
+  --file /path/to/output_directory/sim_evals/
+
+# Run all scenario/milestone evaluations on the platform
+uv run cxas run \
+  --app-name "projects/.../locations/.../apps/..." \
+  --eval-type scenarios \
+  --run-count 3 \
+  --wait
 ```
 
 ## Interpreting Cognitive Diagnostics

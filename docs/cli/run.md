@@ -9,6 +9,9 @@ cxas run --app-name APP
          [--evaluation-id EVAL]
          [--display-name-prefix PREFIX]
          [--tags TAG ...]
+         [--eval-type goldens|scenarios|all]
+         [--run-count COUNT]
+         [--golden-run-method STABLE|NAIVE]
          [--wait]
          [--filter-auto-metrics]
          [--modality text|audio]
@@ -22,11 +25,14 @@ cxas run --app-name APP
 | `--evaluation-id EVAL` | No* | — | Full resource name of a specific evaluation to run. |
 | `--display-name-prefix PREFIX` | No* | — | Run all evaluations whose display name starts with this string. |
 | `--tags TAG ...` | No* | — | Space-separated list of tags. Runs all evaluations that have at least one of the specified tags. |
+| `--eval-type goldens\|scenarios\|all` | No* | — | Run all evaluations of a specific category (`goldens`, `scenarios` — including CXAS 2.0 Milestone evaluations — or `all`). |
+| `--run-count COUNT` | No | — | Number of times to run each evaluation (e.g., `--run-count 5` for statistical confidence across scenario runs). |
+| `--golden-run-method STABLE\|NAIVE` | No | `STABLE` | Replay method for golden evaluations (`STABLE` replays each turn in isolation; `NAIVE` carries session state across turns). |
 | `--wait` | No | `false` | Block until all triggered evaluations complete and exit with code `0` on pass or `1` on fail. Without this flag the command fires the run and returns immediately. |
 | `--filter-auto-metrics` | No | `false` | When waiting for results, ignore automated LLM metrics (semantic similarity, hallucination) and only assess custom expectations and tool invocation results. Useful when you care about business-logic correctness rather than language quality scores. |
 | `--modality text\|audio` | No | `text` | The modality to use when executing the evaluation. |
 
-*You must provide at least one of `--evaluation-id`, `--display-name-prefix`, or `--tags`.
+*You must provide at least one of `--evaluation-id`, `--display-name-prefix`, `--tags`, or `--eval-type`.
 
 ## How Waiting Works
 
@@ -34,11 +40,11 @@ When you pass `--wait`, the CLI:
 
 1. Snapshots the current evaluation results before triggering.
 2. Triggers the specified evaluation(s).
-3. Polls every 5 seconds for up to 10 minutes until all new results reach `COMPLETED` or `ERROR` state.
-4. Prints a summary of passed / failed / errored turns.
+3. Polls every 5 seconds for up to 10 minutes until all new results reach `COMPLETED` or `ERROR` state (accounting for `--run-count` when multiple runs per evaluation are requested).
+4. Prints a summary of passed / failed / errored turns or milestones.
 5. Exits `0` if all evaluations passed, `1` otherwise.
 
-If a test fails, the CLI prints a breakdown of each failed turn, including the failure type, expected vs. actual value, and (if applicable) a score.
+If a test fails, the CLI prints a breakdown of each failed turn or milestone, including the failure type, expected vs. actual value, and (if applicable) a score.
 
 ## Examples
 
@@ -48,6 +54,16 @@ If a test fails, the CLI prints a breakdown of each failed turn, including the f
 cxas run \
   --app-name projects/my-gcp-project/locations/us-central1/apps/abc123 \
   --evaluation-id projects/my-gcp-project/locations/us-central1/apps/abc123/evaluations/eval-001 \
+  --wait
+```
+
+**Run all milestone/scenario evaluations 3 times each and wait for completion:**
+
+```bash
+cxas run \
+  --app-name projects/my-gcp-project/locations/us-central1/apps/abc123 \
+  --eval-type scenarios \
+  --run-count 3 \
   --wait
 ```
 

@@ -83,6 +83,7 @@ def run_all_evals(
     retry_parallel: int | None = None,
     retry_cooldown: float = 60.0,
     golden_run_method: str = "STABLE",
+    platform_sims: bool = False,
 ) -> typing.Any:
     """Runs all evaluations and returns aggregated results.
 
@@ -319,6 +320,8 @@ def run_all_evals(
                         sim_kwargs["retry_cooldown"] = retry_cooldown
                     if audio_analysis:
                         sim_kwargs["audio_analysis"] = audio_analysis
+                    if platform_sims:
+                        sim_kwargs["run_on_platform"] = platform_sims
                     sim_results = sim_evals.run_simulations(
                         test_cases,
                         runs=runs,
