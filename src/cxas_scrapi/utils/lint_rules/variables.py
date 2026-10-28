@@ -248,7 +248,15 @@ class _StateAccessVisitor(ast.NodeVisitor):
         return False
 
     def visit_Module(self, node: ast.Module) -> None:
-        for sub in ast.walk(node):
+        stack: list[ast.AST] = [
+            stmt
+            for stmt in node.body
+            if not isinstance(
+                stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            )
+        ]
+        while stack:
+            sub = stack.pop()
             if isinstance(sub, ast.Assign) and not self._is_state_attr(
                 sub.value
             ):
@@ -263,33 +271,37 @@ class _StateAccessVisitor(ast.NodeVisitor):
                         )
                     ):
                         self._module_shadows_state = True
+            for child in ast.iter_child_nodes(sub):
+                if not isinstance(
+                    child,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                ):
+                    stack.append(child)
         self.generic_visit(node)
 
     def _visit_func(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        aliases: set[str] = set()
-        shadowed: set[str] = set()
-        for stmt in node.body:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for sub in ast.walk(stmt):
-                if isinstance(sub, ast.Assign):
-                    is_ctx = self._is_state_attr(sub.value)
-                    for target in sub.targets:
-                        if isinstance(target, ast.Name):
-                            if is_ctx:
-                                aliases.add(target.id)
-                                shadowed.discard(target.id)
-                            else:
-                                shadowed.add(target.id)
-                        elif isinstance(target, ast.Tuple):
-                            for elt in target.elts:
-                                if isinstance(elt, ast.Name):
-                                    shadowed.add(elt.id)
-        self._scope_stack.append((aliases, shadowed))
+        self._scope_stack.append((set(), set()))
         try:
             self.generic_visit(node)
         finally:
             self._scope_stack.pop()
+
+    def _record_target_binding(self, target: ast.AST, is_ctx: bool) -> None:
+        if not self._scope_stack:
+            return
+        aliases, shadowed = self._scope_stack[-1]
+        if isinstance(target, ast.Name):
+            if is_ctx:
+                aliases.add(target.id)
+                shadowed.discard(target.id)
+            else:
+                shadowed.add(target.id)
+                aliases.discard(target.id)
+        elif isinstance(target, ast.Tuple):
+            for elt in target.elts:
+                if isinstance(elt, ast.Name):
+                    shadowed.add(elt.id)
+                    aliases.discard(elt.id)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_func(node)
@@ -339,6 +351,23 @@ class _StateAccessVisitor(ast.NodeVisitor):
                     )
                 self._skip_subscripts.add(id(target))
         self.generic_visit(node)
+        is_ctx = self._is_state_attr(node.value)
+        for target in node.targets:
+            self._record_target_binding(target, is_ctx)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        target = node.target
+        if isinstance(target, ast.Subscript) and self._is_state_target(
+            target.value
+        ):
+            key = self._const_str(target.slice)
+            if key is not None and node.value is not None:
+                rhs_type = self._literal_type_name(node.value)
+                self.accesses.append(("write", key, target.lineno, rhs_type))
+            self._skip_subscripts.add(id(target))
+        self.generic_visit(node)
+        if node.value is not None:
+            self._record_target_binding(target, self._is_state_attr(node.value))
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         target = node.target

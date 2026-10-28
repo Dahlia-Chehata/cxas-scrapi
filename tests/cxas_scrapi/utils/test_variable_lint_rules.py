@@ -264,3 +264,30 @@ def test_state_visitor_ignores_non_context_state_and_tracks_aliases(
         ("read", "undeclared_session_var", 11, None),
         ("write", "flat_str", 12, "str"),
     ]
+
+
+def test_state_visitor_function_local_shadow_does_not_disable_sibling_state_param() -> (
+    None
+):
+    src = (
+        "def _other_helper(self):\n"
+        "    state = self.state\n"
+        "    state['ignored_internal'] = 1\n"
+        "\n"
+        "def _mutate_session(state: dict):\n"
+        "    state['undeclared_var'] = 'x'\n"
+    )
+    accesses = _collect_state_accesses(src)
+    assert accesses == [("write", "undeclared_var", 6, "str")]
+
+
+def test_state_visitor_tracks_rebound_state_alias_in_statement_order() -> None:
+    src = (
+        "def before_model_callback(callback_context, llm_request):\n"
+        "    state = callback_context.state\n"
+        "    val = state.get('undeclared_key')\n"
+        "    state = dict(state)\n"
+        "    state['local_copy_only'] = val\n"
+    )
+    accesses = _collect_state_accesses(src)
+    assert accesses == [("read", "undeclared_key", 3, None)]
