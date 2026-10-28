@@ -731,6 +731,8 @@ class SimulationEvalStructure(Rule):
             "target_tool",
             "user_ask_summary",
             "legacy_dfcx_lineage",
+            "description",
+            "notes",
         }
     )
 
@@ -754,6 +756,8 @@ class SimulationEvalStructure(Rule):
             "metadata",
             "barge_in_after_ms",
             "bargeInAfterMs",
+            "description",
+            "notes",
         }
     )
 
